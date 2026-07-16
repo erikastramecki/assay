@@ -1,0 +1,22 @@
+# --- build artifacts ---
+**/build/
+**/target/
+**/dist/
+**/node_modules/
+*.so
+
+# --- secrets & keys (NEVER commit) ---
+.env
+.env.*
+*.key
+.operator-sui.key
+.operator.json
+*.keypair.json
+.keys.json
+**/.vercel/
+
+# --- generated / local ---
+src/docs.generated.ts
+# Move ephemeral publication metadata (self-labeled "do not commit")
+**/Pub.*.toml
+.DS_Store

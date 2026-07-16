@@ -1,0 +1,9 @@
+[package]
+name = "dregg_lending"
+edition = "2024.beta"
+
+[dependencies]
+dregg_verifier = { local = "../dregg_verifier" }
+
+[addresses]
+dregg_lending = "0x0"

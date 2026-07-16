@@ -1,0 +1,5 @@
+[package]
+name = "assay_ext_1784082129"
+edition = "2024.beta"
+[addresses]
+assay_ext_1784082129 = "0x0"

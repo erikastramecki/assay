@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "baseUrl": ".",
+    "paths": {
+      "@assay/sui-sdk": ["../sui-sdk/src/index.ts"],
+      "@mysten/sui": ["./node_modules/@mysten/sui"],
+      "@mysten/sui/*": ["./node_modules/@mysten/sui/*"]
+    }
+  },
+  "include": ["src"]
+}

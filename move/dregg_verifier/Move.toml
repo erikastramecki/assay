@@ -1,0 +1,6 @@
+[package]
+name = "dregg_verifier"
+edition = "2024.beta"
+
+[addresses]
+dregg_verifier = "0x0"

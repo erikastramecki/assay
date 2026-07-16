@@ -1,0 +1,21 @@
+#[test_only]
+module dregg_verifier::perloan_bind_test {
+    use dregg_verifier::verifier;
+    fun vk(): vector<u8> { x"6d8b12cf3fcda9070bbd04c972e52a79a4b9c39112bfc021e2f68d81f23006944b44dd7a4c41794492665b100e84a54e71720e9f42c1388a3ecd03fccacba60160889f77383993b3042d441b734dddbc5037c84839812599c98a3a817957729de21f369bdfd771e54b08ac2daadc723478aaef85f4706a07eda48bc3a11891032bc7f71c723a5558fd348d5b7bd442cdd36e64b7a07239580f3e0e8f1337e802e7767e8b6c696d05306c81f45bdcb48a573591a0de95a6390be95a551562331063560fd9c93ea28625f74eaf41c1996e512122512bc6440e8167598bc05414260200000000000000324de9560abf2a97ed292046a0f6afe66ae856d12b50d8d793e566eda0ba82003b2f811b79f47ec5f90b38990c4164677295a8dad46a5c0402bc555ba3382680" }
+    fun proof(): vector<u8> { x"d4789c18257516085218c9e853376693a855646891a2f26021fe223d7c93f784509967d4b46ea3560b96e8cd4eb9d568985c3b96eaf562176186c8284ff6122d31b3e51e37db964693b3378d25bea9de1618702813dd532f874fd0ad9ef477818817776b7896e7b106e4ebd0197423008837e71dbc0ce7400758d7ce5b778890" }
+    fun public_a(): vector<u8> { x"513492413bf2c2dab017ac9e58dcd129f3d59feaab080b020c14b9aa870d4a30" }
+    fun public_wrong(): vector<u8> { x"513492413bf2c2dab017ac9e58dcd129f3d59feaab080b020c14b9aa870d4a31" }
+
+    #[test]
+    fun perloan_proof_verifies_on_chain() {
+        // the per-loan proof (loan A, debt=2000) verifies against ITS public input
+        assert!(verifier::verify(vk(), public_a(), proof()), 1);
+    }
+
+    #[test]
+    fun perloan_proof_rejects_wrong_loan() {
+        // FALSIFICATION: the same proof does NOT verify against a different public
+        // input — the proof is welded to loan A's terms.
+        assert!(!verifier::verify(vk(), public_wrong(), proof()), 2);
+    }
+}

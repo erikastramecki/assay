@@ -1,0 +1,18 @@
+{
+  "name": "@assay/sui-sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Sui client SDK for the Assay dregg_lending_async program (PTB builders, object readers, operator attestation).",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "node --import tsx test/unit.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mysten/sui": "^1.14.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  }
+}

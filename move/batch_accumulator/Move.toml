@@ -1,0 +1,5 @@
+[package]
+name = "batch_accumulator"
+edition = "2024.beta"
+[addresses]
+rwa_batch = "0x0"
