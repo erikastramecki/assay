@@ -12,25 +12,83 @@ module dregg_lending::lending_tests {
     fun publics(): vector<u8> { x"4fb4218c9df27a136e1eccd008ec6067d584f3799f5127c5d378f4b2306ee81d" }
     fun proof(): vector<u8> { x"bb171caeadbbc98aba5d2ef831676b1997a520b948296e7340ce6e2b1f64bf0e6cc6dfc3e82b5cbee3c09644533b07bb05d3fede6af6d05749f4e2d5824cfc17b0332ad583c14825518f20fb7b2ed5d89d885e1270ddd523291ee5f3a402e8a6d18f918c8358101dc140269a47a0657ce9ac1ca12af8b750b711a4db06e5b927" }
 
+    /// F1 REGRESSION — the drain. Before the terms binding, ANY holder of one valid
+    /// (payment_id, proof) could set `debt` to the pool's whole balance and pass
+    /// `coin::zero()` as collateral. This is that exact attack, with the repo's own real
+    /// fixture, and it must now abort ETermsMismatch.
     #[test]
-    fun borrow_then_repay() {
+    #[expected_failure(abort_code = lending::ETermsMismatch)]
+    fun borrow_rejects_unbound_debt_and_zero_collateral() {
+        let mut ctx = tx_context::dummy();
+        let mut pool = lending::create_pool<USDC>(coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), vk(), &mut ctx);
+        let drain = lending::pool_liquidity(&pool);
+        let (loan, pos) = lending::borrow<SSPX, USDC>(
+            &mut pool, coin::zero<SSPX>(&mut ctx), drain, 5000, 7, publics(), proof(), &mut ctx);
+        // unreachable
+        coin::burn_for_testing(loan); test_utils::destroy(pos); test_utils::destroy(pool);
+    }
+
+    /// The honest path is ALSO gated until a re-proven fixture lands: the shipped proof's public
+    /// input is not `loan_commit_of(...)`, so origination is disabled rather than drainable.
+    /// When the fixture arrives this test flips to a passing borrow_then_repay.
+    #[test]
+    #[expected_failure(abort_code = lending::ETermsMismatch)]
+    fun borrow_is_gated_until_the_reproven_fixture_lands() {
         let mut ctx = tx_context::dummy();
         let mut pool = lending::create_pool<USDC>(coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), vk(), &mut ctx);
         let collateral = coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx);
+        let (loan, pos) = lending::borrow<SSPX, USDC>(
+            &mut pool, collateral, 50_000_000, 5000, 7, publics(), proof(), &mut ctx);
+        // unreachable
+        coin::burn_for_testing(loan); test_utils::destroy(pos); test_utils::destroy(pool);
+    }
 
-        // BORROW 50 USDC against 100 sSPX, gated on the real dregg proof (pool's pinned vk)
-        let (loan, pos) = lending::borrow<SSPX, USDC>(&mut pool, collateral, 50_000_000, publics(), proof(), &mut ctx);
-        assert!(coin::value(&loan) == 50_000_000, 1);
-        assert!(lending::pool_liquidity(&pool) == 950_000_000, 2);
-        assert!(lending::position_debt(&pos) == 50_000_000, 3);
+    /// A payment_id that DOES bind these terms gets past the binding — proving the assert is a
+    /// real equality check and not an unconditional reject — and then fails on the proof itself.
+    #[test]
+    #[expected_failure(abort_code = lending::EBadProof)]
+    fun correctly_bound_terms_reach_the_proof_check() {
+        let mut ctx = tx_context::dummy();
+        let mut pool = lending::create_pool<USDC>(coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), vk(), &mut ctx);
+        let collateral = coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx);
+        let pid = lending::expected_payment_id(
+            object::id(&pool), ctx.sender(), 50_000_000, 100_000_000_000, 5000, 7);
+        let (loan, pos) = lending::borrow<SSPX, USDC>(
+            &mut pool, collateral, 50_000_000, 5000, 7, pid, proof(), &mut ctx);
+        // unreachable — binding passes, Groth16 verification fails
+        coin::burn_for_testing(loan); test_utils::destroy(pos); test_utils::destroy(pool);
+    }
 
-        // REPAY 50 USDC, reclaim 100 sSPX
-        let collateral_back = lending::repay<SSPX, USDC>(&mut pool, pos, loan, &mut ctx);
-        assert!(coin::value(&collateral_back) == 100_000_000_000, 4);
-        assert!(lending::pool_liquidity(&pool) == 1_000_000_000, 5);
+    /// The binding must read the ACTUAL collateral coin, not a constant. Commit to 100 sSPX,
+    /// then hand over 50 — must abort. (A mutation hardcoding the amount survived without this.)
+    #[test]
+    #[expected_failure(abort_code = lending::ETermsMismatch)]
+    fun borrow_binds_the_actual_collateral_amount() {
+        let mut ctx = tx_context::dummy();
+        let mut pool = lending::create_pool<USDC>(coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), vk(), &mut ctx);
+        let pid = lending::expected_payment_id(
+            object::id(&pool), ctx.sender(), 50_000_000, 100_000_000_000, 5000, 7);
+        let short = coin::mint_for_testing<SSPX>(50_000_000_000, &mut ctx); // half of what was committed
+        let (loan, pos) = lending::borrow<SSPX, USDC>(
+            &mut pool, short, 50_000_000, 5000, 7, pid, proof(), &mut ctx);
+        // unreachable
+        coin::burn_for_testing(loan); test_utils::destroy(pos); test_utils::destroy(pool);
+    }
 
-        coin::burn_for_testing(collateral_back);
-        test_utils::destroy(pool);
+    /// Likewise the debt: commit to 50 USDC, request 900 — must abort. This is the drain in its
+    /// purest form, with an otherwise perfectly-formed commitment.
+    #[test]
+    #[expected_failure(abort_code = lending::ETermsMismatch)]
+    fun borrow_binds_the_actual_debt() {
+        let mut ctx = tx_context::dummy();
+        let mut pool = lending::create_pool<USDC>(coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), vk(), &mut ctx);
+        let pid = lending::expected_payment_id(
+            object::id(&pool), ctx.sender(), 50_000_000, 100_000_000_000, 5000, 7);
+        let collateral = coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx);
+        let (loan, pos) = lending::borrow<SSPX, USDC>(
+            &mut pool, collateral, 900_000_000, 5000, 7, pid, proof(), &mut ctx);
+        // unreachable
+        coin::burn_for_testing(loan); test_utils::destroy(pos); test_utils::destroy(pool);
     }
 
     #[test]
@@ -57,19 +115,16 @@ module dregg_lending::lending_tests {
     fun borrow_rejects_replay() {
         let mut ctx = tx_context::dummy();
         let mut pool = lending::create_pool<USDC>(coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), vk(), &mut ctx);
-
-        // first borrow consumes payment_id (the proof's nullifier)
-        let c1 = coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx);
-        let (loan1, pos1) = lending::borrow<SSPX, USDC>(&mut pool, c1, 50_000_000, publics(), proof(), &mut ctx);
-
-        // second borrow reusing the SAME proof/payment_id must abort EReplay
-        let c2 = coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx);
-        let (loan2, pos2) = lending::borrow<SSPX, USDC>(&mut pool, c2, 50_000_000, publics(), proof(), &mut ctx);
-
+        let c = coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx);
+        let pid = lending::expected_payment_id(
+            object::id(&pool), ctx.sender(), 50_000_000, 100_000_000_000, 5000, 7);
+        // a valid first borrow cannot be constructed without the re-proven fixture, so seed the
+        // consumed nullifier directly; the second attempt must still be refused as a replay
+        lending::mark_payment_id_used_for_testing(&mut pool, pid);
+        let (loan, pos) = lending::borrow<SSPX, USDC>(
+            &mut pool, c, 50_000_000, 5000, 7, pid, proof(), &mut ctx);
         // unreachable
-        coin::burn_for_testing(loan1); coin::burn_for_testing(loan2);
-        test_utils::destroy(pos1); test_utils::destroy(pos2);
-        test_utils::destroy(pool);
+        coin::burn_for_testing(loan); test_utils::destroy(pos); test_utils::destroy(pool);
     }
 
     #[test]
@@ -79,7 +134,9 @@ module dregg_lending::lending_tests {
         let mut pool = lending::create_pool<USDC>(coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), vk(), &mut ctx);
         let collateral = coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx);
         let bad = x"bb171caeadbbc98aba5d2ef831676b1997a520b948296e7340ce6e2b1f64bf0e6cc6dfc3e82b5cbee3c09644533b07bb05d3fede6af6d05749f4e2d5824cfc17b0332ad583c14825518f20fb7b2ed5d89d885e1270ddd523291ee5f3a402e8a6d18f918c8358101dc140269a47a0657ce9ac1ca12af8b750b711a4db06e5b926";
-        let (loan, pos) = lending::borrow<SSPX, USDC>(&mut pool, collateral, 50_000_000, publics(), bad, &mut ctx);
+        let pid = lending::expected_payment_id(
+            object::id(&pool), ctx.sender(), 50_000_000, 100_000_000_000, 5000, 7);
+        let (loan, pos) = lending::borrow<SSPX, USDC>(&mut pool, collateral, 50_000_000, 5000, 7, pid, bad, &mut ctx);
         // unreachable — borrow aborts
         coin::burn_for_testing(loan);
         test_utils::destroy(pos);

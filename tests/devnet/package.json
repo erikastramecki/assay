@@ -1,2 +1,0 @@
-{ "name": "dregg-lending-devnet", "private": true, "type": "module",
-  "dependencies": { "@mysten/sui": "^2.20.3" } }

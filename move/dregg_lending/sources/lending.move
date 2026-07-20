@@ -15,6 +15,7 @@ module dregg_lending::lending {
     const EWrongRepay: u64 = 0xBAE;
     const EWrongPool: u64 = 0xBAF;
     const EReplay: u64 = 0xBB0;
+    const ETermsMismatch: u64 = 0xBB1; // proof's public input does not commit to THESE loan terms
 
     /// Lender liquidity. `vk` is the PINNED dregg verifying key — the proof gate is
     /// only meaningful against a trusted vk fixed by the lender, never a caller-
@@ -44,20 +45,40 @@ module dregg_lending::lending {
     }
 
     /// Lock `collateral` and, iff the dregg proof verifies against the POOL's pinned
-    /// vk, disburse `debt`. Returns the loan coin and the open Position (bound to the
-    /// pool). Aborts `EBadProof` if the proof does not verify (nothing moves).
-    /// NOTE (audit CRITICAL #1): `payment_id` MUST be a commitment binding
-    /// {pool_id, borrower, debt, collateral, LTV, nonce} for the gate to be sound;
-    /// the on-chain binding check + consumed-nullifier land with the loan_commit
-    /// circuit change (see AUDIT-rwa-lending Part B convergence).
+    /// vk AND commits to exactly these terms, disburse `debt`.
+    ///
+    /// SECURITY (audit F1, was CRITICAL): the proof gate alone proves NOTHING about the loan.
+    /// Groth16 verification only says "this proof is valid for this public input under this vk" —
+    /// it says nothing about `debt` or `collateral`, which used to be free caller-supplied values.
+    /// Any holder of one valid (payment_id, proof) — including an honest borrower issued a proof
+    /// for a small loan — could call this with `debt = pool_liquidity(pool)` and
+    /// `collateral = coin::zero()` and empty the pool, then replay the same pair against every
+    /// other pool pinning the same vk (`used` is per-pool). Proven by PoC against this package.
+    ///
+    /// The fix is the binding that `loan_commit_of` has always computed and nothing ever called:
+    /// the proof's public input must EQUAL the commitment over the ACTUAL pool, sender, debt,
+    /// collateral amount, LTV and nonce. That closes the amount-unbinding, the collateral
+    /// substitution, the sender swap and the cross-pool replay in one assert.
+    ///
+    /// NOTE: this makes the module unable to originate until a re-proven fixture whose public
+    /// input IS `loan_commit_of(...)` lands (perloan-prep/RUNBOOK-terms-binding.md — blocked on
+    /// the 25->26 claim-lane circuit change upstream). That is deliberate: a lending function
+    /// that can be drained must not originate loans. It starts working the moment the fixture does.
     public fun borrow<Collateral, Stable>(
         pool: &mut Pool<Stable>,
         collateral: Coin<Collateral>,
         debt: u64,
+        ltv_bps: u64,
+        nonce: u64,
         payment_id: vector<u8>,
         proof: vector<u8>,
         ctx: &mut TxContext,
     ): (Coin<Stable>, Position<Collateral, Stable>) {
+        // TERMS BINDING (audit F1): the proof must be FOR this loan, not merely valid.
+        let expected = loan_commit_of(
+            object::id(pool), ctx.sender(), debt, coin::value(&collateral), ltv_bps, nonce,
+        );
+        assert!(payment_id == sui::bcs::to_bytes(&expected), ETermsMismatch);
         // single-use: a given proof (its payment_id) can authorize at most one borrow.
         assert!(!table::contains(&pool.used, payment_id), EReplay);
         assert!(verifier::verify(pool.vk, payment_id, proof), EBadProof);
@@ -101,9 +122,10 @@ module dregg_lending::lending {
     // in-circuit gadget (rwa-marketplace/circuit/poseidon/). 32-byte ID/address are
     // split into two <128-bit limbs so every input is a valid BN254 field element.
     //
-    // Wired into `borrow` once the re-proven fixture (public == loan_commit_of) lands
-    // from the Hetzner run — see perloan-prep/RUNBOOK-terms-binding.md. Tested below
-    // for determinism + term-sensitivity + poseidon-identity.
+    // WIRED INTO `borrow` as of the F1 fix — the assert compares the proof's public input
+    // against this commitment over the actual terms. A re-proven fixture (public ==
+    // loan_commit_of) is still required before the module can originate; see
+    // perloan-prep/RUNBOOK-terms-binding.md.
     public fun loan_commit_of(
         pool_id: ID, borrower: address, debt: u64, collateral: u64, ltv_bps: u64, nonce: u64,
     ): u256 {
@@ -126,6 +148,20 @@ module dregg_lending::lending {
         (hi, lo)
     }
 
+    /// Seed a consumed nullifier so the replay guard can be tested without a valid proof
+    /// (which cannot exist until the re-proven fixture lands).
+    #[test_only]
+    public fun mark_payment_id_used_for_testing<Stable>(pool: &mut Pool<Stable>, payment_id: vector<u8>) {
+        table::add(&mut pool.used, payment_id, true);
+    }
+
+    /// The exact bytes `borrow` expects as `payment_id` for these terms.
+    public fun expected_payment_id(
+        pool_id: ID, borrower: address, debt: u64, collateral: u64, ltv_bps: u64, nonce: u64,
+    ): vector<u8> {
+        sui::bcs::to_bytes(&loan_commit_of(pool_id, borrower, debt, collateral, ltv_bps, nonce))
+    }
+
     public fun pool_liquidity<Stable>(p: &Pool<Stable>): u64 { balance::value(&p.liquidity) }
     public fun position_debt<Collateral, Stable>(p: &Position<Collateral, Stable>): u64 { p.debt }
 
@@ -142,11 +178,13 @@ module dregg_lending::lending {
         pool: &mut Pool<Stable>,
         collateral: Coin<Collateral>,
         debt: u64,
+        ltv_bps: u64,
+        nonce: u64,
         payment_id: vector<u8>,
         proof: vector<u8>,
         ctx: &mut TxContext,
     ) {
-        let (loan, pos) = borrow<Collateral, Stable>(pool, collateral, debt, payment_id, proof, ctx);
+        let (loan, pos) = borrow<Collateral, Stable>(pool, collateral, debt, ltv_bps, nonce, payment_id, proof, ctx);
         transfer::public_transfer(loan, ctx.sender());
         transfer::transfer(pos, ctx.sender());
     }
