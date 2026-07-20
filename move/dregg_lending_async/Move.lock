@@ -27,3 +27,27 @@ source = { local = "../../../onchain-sui/move/dregg_verifier" }
 use_environment = "devnet"
 manifest_digest = "41D1BDD28F3C119A169CE18934867517916EFC7FB9628B27D00844D146B950C3"
 deps = { std = "MoveStdlib", sui = "Sui" }
+
+[pinned.testnet.MoveStdlib]
+source = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/move-stdlib", rev = "b9149cbf0b2cb9ae5ed830407a9b48c7ae3fd36c" }
+use_environment = "testnet"
+manifest_digest = "C4FE4C91DE74CBF223B2E380AE40F592177D21870DC2D7EB6227D2D694E05363"
+deps = {}
+
+[pinned.testnet.Sui]
+source = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "b9149cbf0b2cb9ae5ed830407a9b48c7ae3fd36c" }
+use_environment = "testnet"
+manifest_digest = "7AFB66695545775FBFBB2D3078ADFD084244D5002392E837FDE21D9EA1C6D01C"
+deps = { MoveStdlib = "MoveStdlib" }
+
+[pinned.testnet.dregg_lending_async]
+source = { root = true }
+use_environment = "testnet"
+manifest_digest = "1CA59B4620760217ED0C5BEC3421C5CCB1E3555DC1F258044088110396685690"
+deps = { dregg_verifier = "dregg_verifier", std = "MoveStdlib", sui = "Sui" }
+
+[pinned.testnet.dregg_verifier]
+source = { local = "../dregg_verifier" }
+use_environment = "testnet"
+manifest_digest = "5745706258F61D6CE210904B3E6AE87A73CE9D31A6F93BE4718C442529332A87"
+deps = { std = "MoveStdlib", sui = "Sui" }

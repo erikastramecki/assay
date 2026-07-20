@@ -33,6 +33,16 @@ module dregg_lending_async::async_lending {
     const EWrongPool: u64 = 0xC0A;      // this OperatorCap was minted for a different pool (audit R2-1)
     const EBadPubkey: u64 = 0xC0B;      // operator pubkey must be 32 bytes and not a low-order point (R2-3)
     const EBadCurve: u64 = 0xC0C;       // rate curve parameters would overflow accrual (audit R2-2)
+    const EBadSeize: u64 = 0xC0D;       // liquidation would seize more than the position's collateral
+    const ENotUnderwater: u64 = 0xC0E;  // liquidation attestation missing/invalid (audit F3)
+
+    /// DOMAIN SEPARATION (audit F3). Two different things are now signed by the same operator key.
+    /// Without a distinct prefix per message type, a disburse attestation and a liquidation
+    /// attestation could in principle be reinterpreted as one another — the classic cross-protocol
+    /// signature reuse. The tag is length-prefixed by bcs like the type names, so it cannot run
+    /// into the following field.
+    const DOMAIN_DISBURSE: vector<u8> = b"ASSAY_DISBURSE_V1";
+    const DOMAIN_LIQUIDATE: vector<u8> = b"ASSAY_LIQUIDATE_V1";
 
     /// Longest life an attestation may be signed for. The operator's oracle discipline
     /// (pyth.mjs: maxStaleSecs 60) only constrains the INSTANT of signing, so the on-chain
@@ -461,7 +471,8 @@ module dregg_lending_async::async_lending {
     fun attest_msg<Collateral, Stable>(
         pool_id: ID, borrower: address, debt: u64, coll_amt: u64, loan_commit: u256, expiry_s: u64,
     ): vector<u8> {
-        let mut msg = sui::bcs::to_bytes(&borrower);
+        let mut msg = sui::bcs::to_bytes(&DOMAIN_DISBURSE);
+        vector::append(&mut msg, sui::bcs::to_bytes(&borrower));
         vector::append(&mut msg, sui::bcs::to_bytes(&debt));
         vector::append(&mut msg, sui::bcs::to_bytes(&coll_amt));
         vector::append(&mut msg, sui::bcs::to_bytes(&loan_commit));
@@ -607,6 +618,13 @@ module dregg_lending_async::async_lending {
         table::add(&mut pool.used_commits, loan_commit, true);
     }
 
+    #[test_only]
+    public fun liq_attest_msg_for_testing<Collateral, Stable>(
+        pool_id: ID, position_id: ID, seize_amount: u64, expiry_s: u64,
+    ): vector<u8> {
+        liq_attest_msg<Collateral, Stable>(pool_id, position_id, seize_amount, expiry_s)
+    }
+
     /// Exposes the signed preimage so the cross-language byte-equality test can pin it against
     /// `app/sui-sdk/src/attest.ts`. A divergence there fails every signature closed, but silently.
     #[test_only]
@@ -653,25 +671,99 @@ module dregg_lending_async::async_lending {
         coin::from_balance(collateral, ctx)
     }
 
-    /// Operator-attested liquidation of an underwater PENDING position (dregg's
-    /// `dregg_liquidate` kernel admits it only when underwater). The liquidator (sender)
-    /// repays the current debt into the pool and seizes the collateral. Async-aware —
-    /// does NOT wait for batch settle.
+    /// The bytes the operator signs to authorise ONE liquidation. Binds the exact position, the
+    /// exact amount of collateral that may be seized, an expiry, the pool and both types.
+    fun liq_attest_msg<Collateral, Stable>(
+        pool_id: ID, position_id: ID, seize_amount: u64, expiry_s: u64,
+    ): vector<u8> {
+        let mut msg = sui::bcs::to_bytes(&DOMAIN_LIQUIDATE);
+        vector::append(&mut msg, sui::bcs::to_bytes(&pool_id));
+        vector::append(&mut msg, sui::bcs::to_bytes(&position_id));
+        vector::append(&mut msg, sui::bcs::to_bytes(&seize_amount));
+        vector::append(&mut msg, sui::bcs::to_bytes(&expiry_s));
+        vector::append(&mut msg, sui::bcs::to_bytes(&type_name::into_string(type_name::get<Collateral>())));
+        vector::append(&mut msg, sui::bcs::to_bytes(&type_name::into_string(type_name::get<Stable>())));
+        msg
+    }
+
+    /// Operator-attested liquidation of an underwater PENDING position. The liquidator repays the
+    /// current debt and seizes `seize_amount` of collateral; ANY SURPLUS GOES BACK TO THE BORROWER.
+    ///
+    /// SECURITY (audit F3, was HIGH): the doc comment used to claim this was operator-attested and
+    /// underwater-only, but the body verified no attestation, read no price, and checked no health
+    /// condition — the sole gate was an UNUSED `_cap` parameter, and it seized 100% of the
+    /// collateral with no refund. Two separate harms: a cap holder could liquidate a perfectly
+    /// HEALTHY position (pay debt_now, take all the collateral, ~1.43x on stablecoin outlaid,
+    /// repeatable across every open loan), and even on the honest path a position 1bp underwater
+    /// forfeited everything, contradicting the non-custodial design.
+    ///
+    /// Now it requires BOTH the pool's cap AND an ed25519 attestation from the operator key over
+    /// (pool, position, seize_amount, expiry). Those are different keys in the real deployment —
+    /// the cap sits with the deployer, the attestation key with the API — so liquidation takes two
+    /// parties, and the operator must put its signature on the exact amount being taken.
+    ///
+    /// The health/price decision still lives off-chain (there is no on-chain oracle in this
+    /// module), but it is now SIGNED, AMOUNT-BOUND and SHORT-LIVED rather than unlimited
+    /// discretion. No nullifier is needed: the Position is consumed, so the attestation cannot be
+    /// replayed against it.
     public fun liquidate<Collateral, Stable>(
         cap: &OperatorCap,
-        pool: &mut Pool<Stable>, pos: Position<Collateral, Stable>, payment: Coin<Stable>, clock: &Clock, ctx: &mut TxContext,
+        pool: &mut Pool<Stable>,
+        pos: Position<Collateral, Stable>,
+        payment: Coin<Stable>,
+        seize_amount: u64,
+        expiry_s: u64,
+        attestation: vector<u8>,
+        clock: &Clock,
+        ctx: &mut TxContext,
     ): Coin<Collateral> {
         assert_cap(cap, pool);
         assert!(pos.pool_id == object::id(pool), EWrongPool); // audit R3: position belongs to THIS pool
-        accrue(pool, now_s(clock));
+        let now = now_s(clock);
+        assert!(now <= expiry_s, EAttestExpired);
+        assert!(expiry_s <= now + MAX_ATTEST_WINDOW_S, EAttestWindow);
+        let msg = liq_attest_msg<Collateral, Stable>(
+            object::id(pool), object::id(&pos), seize_amount, expiry_s,
+        );
+        assert!(sui::ed25519::ed25519_verify(&attestation, &pool.operator_pubkey, &msg), ENotUnderwater);
+        liquidate_body<Collateral, Stable>(pool, pos, payment, seize_amount, now, ctx)
+    }
+
+    /// Everything liquidation does AFTER the attestation verifies. Factored out for the same
+    /// reason as `attested_disburse_body`: a valid ed25519 signature cannot be produced inside a
+    /// Move test, so without this the settlement accounting and the surplus refund would be
+    /// untestable. Shared body, so the tested path cannot drift from the real one.
+    fun liquidate_body<Collateral, Stable>(
+        pool: &mut Pool<Stable>, pos: Position<Collateral, Stable>, payment: Coin<Stable>,
+        seize_amount: u64, now: u64, ctx: &mut TxContext,
+    ): Coin<Collateral> {
+        accrue(pool, now);
         let owed = debt_now(pool, &pos);
         assert!(coin::value(&payment) == owed, EWrongRepay);
         pool.total_borrows = if (pool.total_borrows > owed) { pool.total_borrows - owed } else { 0 };
         release_exposure<Collateral, Stable>(pool, pos.principal);
         balance::join(&mut pool.liquidity, coin::into_balance(payment));
-        let Position { id, pool_id: _, borrower: _, collateral, principal: _, index_snapshot: _, batch_id: _ } = pos;
+
+        let Position { id, pool_id: _, borrower, mut collateral, principal: _, index_snapshot: _, batch_id: _ } = pos;
         object::delete(id);
-        coin::from_balance(collateral, ctx)
+        assert!(seize_amount <= balance::value(&collateral), EBadSeize);
+        let seized = balance::split(&mut collateral, seize_amount);
+        // SURPLUS BACK TO THE BORROWER — the protocol takes what the debt plus the operator's
+        // bonus justifies, never the whole position.
+        if (balance::value(&collateral) > 0) {
+            transfer::public_transfer(coin::from_balance(collateral, ctx), borrower);
+        } else {
+            balance::destroy_zero(collateral);
+        };
+        coin::from_balance(seized, ctx)
+    }
+
+    #[test_only]
+    public fun liquidate_body_for_testing<Collateral, Stable>(
+        pool: &mut Pool<Stable>, pos: Position<Collateral, Stable>, payment: Coin<Stable>,
+        seize_amount: u64, now: u64, ctx: &mut TxContext,
+    ): Coin<Collateral> {
+        liquidate_body<Collateral, Stable>(pool, pos, payment, seize_amount, now, ctx)
     }
 
     /// Permissionless batch settle: the batch proof must verify against the on-chain

@@ -103,12 +103,21 @@ export function repay(
 /** Operator-attested liquidation of an underwater position. Returns the seized collateral to the caller. */
 export function liquidate(
   tx: Transaction,
-  o: { pkg: string; collType: string; stableType: string; cap: string; pool: string; position: string; paymentCoin: TransactionArgument; recipient: string },
+  o: {
+    pkg: string; collType: string; stableType: string; cap: string; pool: string; position: string;
+    paymentCoin: TransactionArgument;
+    /** Base units of collateral to seize; the surplus is refunded to the borrower on-chain. */
+    seizeAmount: bigint; expiryS: bigint; attestation: Uint8Array; recipient: string;
+  },
 ) {
   const coll = tx.moveCall({
     target: target(o.pkg, "liquidate"),
     typeArguments: [o.collType, o.stableType],
-    arguments: [tx.object(o.cap), tx.object(o.pool), tx.object(o.position), o.paymentCoin, tx.object(CLOCK_ID)],
+    arguments: [
+      tx.object(o.cap), tx.object(o.pool), tx.object(o.position), o.paymentCoin,
+      tx.pure.u64(o.seizeAmount), tx.pure.u64(o.expiryS),
+      tx.pure.vector("u8", Array.from(o.attestation)), tx.object(CLOCK_ID),
+    ],
   });
   tx.transferObjects([coll], o.recipient);
 }

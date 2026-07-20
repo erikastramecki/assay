@@ -4,6 +4,7 @@ import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import assert from "node:assert";
 import {
   attestationMessage, signAttestation, operatorPubkeyBytes, verifyAttestation,
+  liquidationMessage, signLiquidation,
   currentDebt, sharesToAssets, ptb,
 } from "../src/index.ts";
 
@@ -27,8 +28,11 @@ const TERMS = {
 console.log("attestation:");
 await t("message binds addr+debt+coll+commit+expiry+pool+TYPEs at correct offsets", () => {
   const m = attestationMessage(TERMS);
-  assert.ok(m.length > 120, "120 fixed bytes + two length-prefixed type names");
-  const at = (off) => new DataView(m.buffer, m.byteOffset + off, 8).getBigUint64(0, true);
+  // "ASSAY_DISBURSE_V1" is 17 chars + a 1-byte ULEB length prefix = 18 bytes of domain tag,
+  // then the fixed region: borrower 32, debt 8, coll 8, loan_commit 32, expiry 8, pool 32.
+  const TAG = 18;
+  assert.ok(m.length > TAG + 120, "tag + 120 fixed bytes + two length-prefixed type names");
+  const at = (off) => new DataView(m.buffer, m.byteOffset + TAG + off, 8).getBigUint64(0, true);
   assert.equal(at(32), 500_000_000n);    // debt
   assert.equal(at(40), 10_000_000_000n); // collateral amount
   assert.equal(at(80), 1_700_000_060n);  // expiry (after the 32-byte loan_commit)
@@ -70,6 +74,25 @@ await t("a different operator's signature does not verify", async () => {
   const op1 = new Ed25519Keypair(), op2 = new Ed25519Keypair();
   const sig = await signAttestation(op1, TERMS);
   assert.equal(await verifyAttestation(operatorPubkeyBytes(op2), sig, TERMS), false);
+});
+
+await t("liquidation message binds pool+position+seize+expiry+TYPEs", async () => {
+  const L = { poolId: POOL, positionId: POOL2, seizeAmount: 7_000_000_000n, expiryS: 1_700_000_060n, collateralType: COLL, stableType: STABLE };
+  const op = new Ed25519Keypair();
+  const sig = await signLiquidation(op, L);
+  assert.equal(sig.length, 64);
+  // every term is bound — flipping any one changes the bytes
+  for (const over of [{ seizeAmount: 1n }, { expiryS: 1n }, { poolId: POOL2 }, { positionId: POOL }, { collateralType: COLL2 }, { stableType: STABLE2 }]) {
+    assert.notDeepEqual(Array.from(liquidationMessage(L)), Array.from(liquidationMessage({ ...L, ...over })));
+  }
+});
+
+await t("a disburse attestation is NOT a liquidation authorisation (domain separation)", () => {
+  // Without distinct domain tags the same operator key signs two message types, and one could in
+  // principle be reinterpreted as the other. The tags must make collision impossible.
+  const d = attestationMessage(TERMS);
+  const l = liquidationMessage({ poolId: POOL, positionId: POOL2, seizeAmount: 7n, expiryS: 1n, collateralType: COLL, stableType: STABLE });
+  assert.notDeepEqual(Array.from(d.slice(0, 18)), Array.from(l.slice(0, 18)));
 });
 
 console.log("math:");

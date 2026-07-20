@@ -139,10 +139,13 @@ module dregg_lending_async::async_lending_tests {
             &cap, &mut pool, coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx),
             500_000_000, @0xB0B, 7u256, &clk, &mut ctx);
 
-        // operator-attested liquidation (underwater per dregg_liquidate, off-chain):
-        // liquidator repays 500, seizes the collateral.
-        let seized = al::liquidate<SSPX, USDC>(&cap, &mut pool, pos, coin::mint_for_testing<USDC>(500_000_000, &mut ctx), &clk, &mut ctx);
-        assert!(coin::value(&seized) == 100_000_000_000, 0);
+        // Operator-attested liquidation. The operator prices it off-chain and signs the exact
+        // seize amount; here we drive the post-signature body directly (Move cannot produce a
+        // valid ed25519 signature). Seize 70 of the 100 sSPX — the other 30 must go BACK to the
+        // borrower, which is the half of audit F3 that harmed borrowers even with an honest operator.
+        let seized = al::liquidate_body_for_testing<SSPX, USDC>(
+            &mut pool, pos, coin::mint_for_testing<USDC>(500_000_000, &mut ctx), 70_000_000_000, 0, &mut ctx);
+        assert!(coin::value(&seized) == 70_000_000_000, 0);
         assert!(al::pool_borrows(&pool) == 0, 1);
         assert!(al::pool_cash(&pool) == 1_000_000_000, 2); // 1000 − 500 + 500
 
@@ -365,9 +368,40 @@ module dregg_lending_async::async_lending_tests {
         clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
     }
 
+    /// F3 REGRESSION — liquidation used to need no attestation at all: the cap alone let a holder
+    /// seize any HEALTHY position. A forged signature must now be refused.
+    #[test]
+    #[expected_failure(abort_code = al::ENotUnderwater)]
+    fun liquidate_rejects_forged_attestation() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        let (loan, pos) = al::disburse<SSPX, USDC>(&cap, &mut pool,
+            coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx), 100_000_000, ctx.sender(), 5u256, &clk, &mut ctx);
+        let coll = al::liquidate<SSPX, USDC>(&cap, &mut pool, pos,
+            coin::mint_for_testing<USDC>(100_000_000, &mut ctx), 100_000_000_000, 60, FORGED, &clk, &mut ctx);
+        // unreachable
+        coin::burn_for_testing(loan); coin::burn_for_testing(coll);
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    /// Seizing more collateral than the position holds must abort rather than silently clamp.
+    #[test]
+    #[expected_failure(abort_code = al::EBadSeize)]
+    fun liquidate_cannot_seize_more_than_the_collateral() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        let (loan, pos) = al::disburse<SSPX, USDC>(&cap, &mut pool,
+            coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx), 100_000_000, ctx.sender(), 6u256, &clk, &mut ctx);
+        let coll = al::liquidate_body_for_testing<SSPX, USDC>(
+            &mut pool, pos, coin::mint_for_testing<USDC>(100_000_000, &mut ctx), 100_000_000_001, 0, &mut ctx);
+        // unreachable
+        coin::burn_for_testing(loan); coin::burn_for_testing(coll);
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
     #[test]
     fun attest_msg_matches_typescript_byte_for_byte() {
-        let expected: vector<u8> = x"00000000000000000000000000000000000000000000000000000000000000bb0065cd1d0000000000e87648170000002a000000000000000000000000000000000000000000000000000000000000003c0000000000000000000000000000000000000000000000000000000000000000000000000000aa5b303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303a3a6173796e635f6c656e64696e675f74657374733a3a535350585b303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303a3a6173796e635f6c656e64696e675f74657374733a3a55534443";
+        let expected: vector<u8> = x"1141535341595F44495342555253455F563100000000000000000000000000000000000000000000000000000000000000BB0065CD1D0000000000E87648170000002A000000000000000000000000000000000000000000000000000000000000003C0000000000000000000000000000000000000000000000000000000000000000000000000000AA5B303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303A3A6173796E635F6C656E64696E675F74657374733A3A535350585B303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303A3A6173796E635F6C656E64696E675F74657374733A3A55534443";
         let actual = al::attest_msg_for_testing<SSPX, USDC>(
             object::id_from_address(@0xaa), // pool
             @0xbb,                          // borrower
@@ -377,6 +411,31 @@ module dregg_lending_async::async_lending_tests {
             60,                             // expiry_s
         );
         assert!(actual == expected, 0);
+    }
+
+    /// Same pin for the LIQUIDATION preimage — a second message type now shares the operator key,
+    /// so its layout needs the same protection against silent cross-language drift.
+    #[test]
+    fun liq_attest_msg_matches_typescript_byte_for_byte() {
+        let expected: vector<u8> = x"1241535341595F4C49515549444154455F563100000000000000000000000000000000000000000000000000000000000000AA00000000000000000000000000000000000000000000000000000000000000CC00863BA1010000003C000000000000005B303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303A3A6173796E635F6C656E64696E675F74657374733A3A535350585B303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303A3A6173796E635F6C656E64696E675F74657374733A3A55534443";
+        let actual = al::liq_attest_msg_for_testing<SSPX, USDC>(
+            object::id_from_address(@0xaa), object::id_from_address(@0xcc), 7_000_000_000, 60);
+        assert!(actual == expected, 0);
+    }
+
+    /// The two preimages must never collide: distinct domain tags mean a disburse attestation
+    /// cannot be reinterpreted as a liquidation authorisation.
+    #[test]
+    fun disburse_and_liquidation_preimages_are_domain_separated() {
+        let d = al::attest_msg_for_testing<SSPX, USDC>(
+            object::id_from_address(@0xaa), @0xbb, 500_000_000, 100_000_000_000, 42u256, 60);
+        let l = al::liq_attest_msg_for_testing<SSPX, USDC>(
+            object::id_from_address(@0xaa), object::id_from_address(@0xcc), 7_000_000_000, 60);
+        assert!(d != l, 0);
+        // The tags differ at byte 0 (ULEB length: "ASSAY_DISBURSE_V1" is 17, "ASSAY_LIQUIDATE_V1"
+        // is 18) and at byte 7 ('D' vs 'L'). Byte 1 is 'A' in both — both start "ASSAY_".
+        assert!(*vector::borrow(&d, 0) != *vector::borrow(&l, 0), 1);
+        assert!(*vector::borrow(&d, 7) != *vector::borrow(&l, 7), 2);
     }
 
     #[test]
@@ -408,7 +467,9 @@ module dregg_lending_async::async_lending_tests {
         let (loan, pos) = al::disburse<SSPX, USDC>(&cap_b, &mut pool_b,
             coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx), 500_000_000, ctx.sender(), 1u256, &clk, &mut ctx);
         // pool A's own cap passes assert_cap, so only the position binding stops this
-        let coll = al::liquidate<SSPX, USDC>(&cap_a, &mut pool_a, pos, coin::mint_for_testing<USDC>(500_000_000, &mut ctx), &clk, &mut ctx);
+        let coll = al::liquidate<SSPX, USDC>(
+            &cap_a, &mut pool_a, pos, coin::mint_for_testing<USDC>(500_000_000, &mut ctx),
+            100_000_000_000, 60, FORGED, &clk, &mut ctx);
         // unreachable
         coin::burn_for_testing(loan); coin::burn_for_testing(coll);
         clock::destroy_for_testing(clk);

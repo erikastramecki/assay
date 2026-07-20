@@ -10,7 +10,7 @@ import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import { Transaction } from "@mysten/sui/transactions";
 import { readFileSync } from "node:fs";
 import os from "node:os";
-import { ptb, exactCoin, readPool, allOpenPositions, accrueIndex, currentDebt, operatorPubkeyBytes } from "../src/index.ts";
+import { ptb, exactCoin, readPool, allOpenPositions, accrueIndex, currentDebt, operatorPubkeyBytes, signLiquidation } from "../src/index.ts";
 import { fetchPythPrice, applyOraclePolicy } from "../../../operator/pyth.mjs";
 
 const HOME = os.homedir();
@@ -22,6 +22,12 @@ const VK = Uint8Array.from(readFileSync(new URL("../../../perloan-prep/proof_A_s
 
 const kp = Ed25519Keypair.fromSecretKey(process.env.SUI_PRIVKEY.trim());
 const me = kp.toSuiAddress();
+// The OPERATOR signing key — liquidation now requires an ed25519 attestation over the exact seize
+// amount (audit F3), not just the cap. Same precedence as app/operator-api/server-sui.mjs.
+const operatorSecret = process.env.OPERATOR_KEY_INLINE
+  ? process.env.OPERATOR_KEY_INLINE.trim()
+  : readFileSync(process.env.OPERATOR_KEY || new URL("../../../app/operator-api/.operator-sui.key", import.meta.url).pathname, "utf8").trim();
+const operator = Ed25519Keypair.fromSecretKey(operatorSecret);
 const client = new SuiClient({ url: getFullnodeUrl("devnet") });
 let LENDING = process.env.LENDING, POOL = process.env.POOL, OPCAP = process.env.OPCAP;
 const args = process.argv.slice(2);
@@ -52,22 +58,34 @@ async function tick() {
     console.log(`  ${m.sym} ${p.id.slice(0, 8)}…: collateral $${collVal.toFixed(2)} · debt $${debt.toFixed(2)} · health ${health.toFixed(2)} ${health < 1 ? "🔴 UNDERWATER" : "🟢 ok"}`);
     if (health < 1) {
       const owed = currentDebt(p, idx); // exact on a rate=0 pool
+      // AUDIT F3: the contract no longer lets the cap holder take the whole position on its own
+      // say-so. The operator signs the exact seize amount and the surplus is refunded to the
+      // borrower on-chain. Seize only what the debt plus the liquidation bonus is worth.
+      const bonusBps = Number(process.env.LIQ_BONUS_BPS || 500); // 5%
+      const seizeUsd = debt * (1 + bonusBps / 10000);
+      const seizeUnits = Math.min(Number(p.collateral), Math.ceil((seizeUsd / px) * 10 ** m.decimals));
+      const seizeAmount = BigInt(seizeUnits);
+      const expiryS = BigInt(Math.floor(Date.now() / 1000) + 90);
+      const attestation = await signLiquidation(operator, {
+        poolId: POOL, positionId: p.id, seizeAmount, expiryS,
+        collateralType: p.collateralType, stableType: STABLE,
+      });
       const tx = new Transaction();
       const pay = await exactCoin(tx, client, me, STABLE, owed);
-      ptb.liquidate(tx, { pkg: LENDING, collType: p.collateralType, stableType: STABLE, cap: OPCAP, pool: POOL, position: p.id, paymentCoin: pay, recipient: me });
+      ptb.liquidate(tx, { pkg: LENDING, collType: p.collateralType, stableType: STABLE, cap: OPCAP, pool: POOL, position: p.id, paymentCoin: pay, seizeAmount, expiryS, attestation, recipient: me });
       const r = await exec(tx);
-      console.log(`    ⚡ LIQUIDATED — paid $${(Number(owed) / STABLE_UNIT).toFixed(2)}, seized ${Number(p.collateral) / 10 ** m.decimals} ${m.sym}  tx ${r.digest}`);
+      console.log(`    ⚡ LIQUIDATED — paid $${(Number(owed) / STABLE_UNIT).toFixed(2)}, seized ${seizeUnits / 10 ** m.decimals} ${m.sym} (surplus ${(Number(p.collateral) - seizeUnits) / 10 ** m.decimals} refunded to borrower)  tx ${r.digest}`);
     }
   }
 }
 
 if (DEMO) {
-  const capOwner = Ed25519Keypair.fromSecretKey(readFileSync(new URL("../../../app/operator-api/.operator-sui.key", import.meta.url), "utf8").trim());
+  const capOwner = operator; // the TreasuryCaps live with the operator key
   const COINS = "0x537ba694cf26744a208ac69001a2102f12258e2999834ed8ea0b0cc941667d1f", CAP_USDC = "0x6ac4c50740c98fc78057c62efb00bc96ca7e0201f7c854f5d86bb906cafe6446";
   const sol = markets.markets.find((m) => m.sym === "SOL"), solType = ctOf(sol);
   await exec((() => { const t = new Transaction(); t.moveCall({ target: `${COINS}::tusdc::mint`, arguments: [t.object(CAP_USDC), t.pure.u64(300_000_000n), t.pure.address(me)] }); return t; })(), capOwner);
   await exec((() => { const t = new Transaction(); t.moveCall({ target: sol.mintTarget, arguments: [t.object(sol.cap), t.pure.u64(1_000_000_000n), t.pure.address(me)] }); return t; })(), capOwner);
-  { const t = new Transaction(); ptb.initPool(t, { pkg: LENDING, stableType: STABLE, curve: { baseBps: 0, slope1Bps: 0, slope2Bps: 0, kinkBps: 8000, reserveBps: 0 }, cap: 1_000_000_000_000n, perCollateralCap: 0n, vk: VK, operatorPubkey: operatorPubkeyBytes(new Ed25519Keypair()) });
+  { const t = new Transaction(); ptb.initPool(t, { pkg: LENDING, stableType: STABLE, curve: { baseBps: 0, slope1Bps: 0, slope2Bps: 0, kinkBps: 8000, reserveBps: 0 }, cap: 1_000_000_000_000n, perCollateralCap: 0n, vk: VK, operatorPubkey: operatorPubkeyBytes(operator) });
     const r = await exec(t); POOL = created(r, "async_lending::Pool"); OPCAP = created(r, "async_lending::OperatorCap"); }
   { const t = new Transaction(); const c = await exactCoin(t, client, me, STABLE, 200_000_000n); ptb.deposit(t, { pkg: LENDING, stableType: STABLE, pool: POOL, coin: c }); await exec(t); }
   // underwater by construction: 1 SOL (~$77) collateral, $70 debt → threshold $77·72% = $55 < $70
