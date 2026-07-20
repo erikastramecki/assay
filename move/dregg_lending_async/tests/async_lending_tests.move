@@ -16,6 +16,7 @@ module dregg_lending_async::async_lending_tests {
     // 32-byte operator ed25519 pubkey (RFC-8032 test vector; NON-degenerate so verify is honest —
     // an all-zero key hits the ed25519 identity edge case. Positive attest path proven on-chain in the harness)
     fun opk(): vector<u8> { x"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a" }
+    fun opk2(): vector<u8> { x"3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c" } // second valid ed25519 pubkey
     fun bad_proof(): vector<u8> { x"bb171caeadbbc98aba5d2ef831676b1997a520b948296e7340ce6e2b1f64bf0e6cc6dfc3e82b5cbee3c09644533b07bb05d3fede6af6d05749f4e2d5824cfc17b0332ad583c14825518f20fb7b2ed5d89d885e1270ddd523291ee5f3a402e8a6d18f918c8358101dc140269a47a0657ce9ac1ca12af8b750b711a4db06e5b927" }
 
     #[test]
@@ -294,7 +295,7 @@ module dregg_lending_async::async_lending_tests {
         // init_pool is permissionless, so an attacker mints their OWN pool + cap for free...
         let (attacker_pool, attacker_cap) = al::new_pool<USDC>(0, 0, 0, 8000, 0, 1, 0, vk(), opk(), &clk, &mut ctx);
         // ...and points it at the victim pool to seize the signing key. Must abort.
-        al::set_operator_pubkey(&attacker_cap, &mut victim, x"0202020202020202020202020202020202020202020202020202020202020202", &mut ctx);
+        al::propose_operator_pubkey(&attacker_cap, &mut victim, x"0202020202020202020202020202020202020202020202020202020202020202", &clk, &mut ctx);
         // unreachable
         clock::destroy_for_testing(clk);
         test_utils::destroy(victim); test_utils::destroy(victim_cap);
@@ -331,7 +332,7 @@ module dregg_lending_async::async_lending_tests {
     fun rotation_rejects_wrong_length_pubkey() {
         let mut ctx = tx_context::dummy();
         let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
-        al::set_operator_pubkey(&cap, &mut pool, x"0202", &mut ctx); // truncated paste
+        al::propose_operator_pubkey(&cap, &mut pool, x"0202", &clk, &mut ctx); // truncated paste
         // unreachable
         clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
     }
@@ -371,7 +372,7 @@ module dregg_lending_async::async_lending_tests {
     /// F3 REGRESSION — liquidation used to need no attestation at all: the cap alone let a holder
     /// seize any HEALTHY position. A forged signature must now be refused.
     #[test]
-    #[expected_failure(abort_code = al::ENotUnderwater)]
+    #[expected_failure(abort_code = al::EBadLiqAttest)]
     fun liquidate_rejects_forged_attestation() {
         let mut ctx = tx_context::dummy();
         let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
@@ -397,6 +398,81 @@ module dregg_lending_async::async_lending_tests {
         // unreachable
         coin::burn_for_testing(loan); coin::burn_for_testing(coll);
         clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    /// R5 REGRESSION (liveness) — a repaid loan must free its unproven-exposure slot. Before this,
+    /// total_pending was released only by settle_batch, so cumulative lifetime volume would
+    /// permanently brick borrowing at pool.cap even though every loan had been repaid.
+    #[test]
+    fun repaying_frees_the_unproven_exposure_slot() {
+        let mut ctx = tx_context::dummy();
+        let clk = clock::create_for_testing(&mut ctx);
+        // cap of exactly one 100-unit loan: a second borrow only fits if the first freed its slot
+        let (mut pool, cap) = al::new_pool<USDC>(0, 0, 0, 8000, 0, 100_000_000, 0, vk(), opk(), &clk, &mut ctx);
+        al::deposit(&mut pool, coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), &clk, &mut ctx);
+        let (l1, p1) = al::disburse<SSPX, USDC>(&cap, &mut pool,
+            coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx), 100_000_000, ctx.sender(), 1u256, &clk, &mut ctx);
+        let c1 = al::repay<SSPX, USDC>(&mut pool, p1, coin::mint_for_testing<USDC>(100_000_000, &mut ctx), &clk, &mut ctx);
+        // second loan of the same size must fit — it would abort EOverCap if the slot leaked
+        let (l2, p2) = al::disburse<SSPX, USDC>(&cap, &mut pool,
+            coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx), 100_000_000, ctx.sender(), 2u256, &clk, &mut ctx);
+        coin::burn_for_testing(l1); coin::burn_for_testing(l2); coin::burn_for_testing(c1);
+        test_utils::destroy(p2);
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    /// R5 REGRESSION — the cap holder must not be able to rotate the signing key and use it in
+    /// the same transaction. That collapsed F3's two-party requirement back into one.
+    #[test]
+    #[expected_failure(abort_code = al::ERotationEarly)]
+    fun rotation_cannot_take_effect_immediately() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        al::propose_operator_pubkey(&cap, &mut pool, opk2(), &clk, &mut ctx);
+        al::commit_operator_pubkey(&cap, &mut pool, &clk, &mut ctx); // same instant — must abort
+        // unreachable
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    #[test]
+    fun rotation_applies_after_the_timelock() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, mut clk) = attest_fixture(0, &mut ctx);
+        al::propose_operator_pubkey(&cap, &mut pool, opk2(), &clk, &mut ctx);
+        clock::set_for_testing(&mut clk, 86_400_000); // a day later, in ms
+        al::commit_operator_pubkey(&cap, &mut pool, &clk, &mut ctx);
+        assert!(al::operator_pubkey_of(&pool) == opk2(), 0);
+        let (pending, at) = al::pending_rotation(&pool);
+        assert!(vector::is_empty(&pending) && at == 0, 1);
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    /// R5 — pin the batch public input. Both of F4's headline bindings (pool id, batch index)
+    /// could previously be deleted with all 33 tests still green.
+    #[test]
+    fun settle_public_input_binds_pool_and_batch_index() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool_a, cap_a, clk) = attest_fixture(0, &mut ctx);
+        let (mut pool_b, cap_b) = al::new_pool<USDC>(0, 0, 0, 8000, 0, 1_000_000_000_000, 0, vk(), opk(), &clk, &mut ctx);
+
+        let a0 = al::settle_public_input_for_testing(&pool_a);
+        assert!(vector::length(&a0) == 128, 0);            // exactly four 32-byte scalars
+        // different pool, same (batch, root) -> different input  => the POOL is bound
+        assert!(a0 != al::settle_public_input_for_testing(&pool_b), 1);
+        // same pool, different batch index -> different input    => the BATCH INDEX is bound
+        al::set_current_batch_for_testing(&mut pool_a, 7);
+        let a7 = al::settle_public_input_for_testing(&pool_a);
+        assert!(a0 != a7, 2);
+        // and the root still matters
+        al::set_current_batch_for_testing(&mut pool_a, 0);
+        let (loan, pos) = al::disburse<SSPX, USDC>(&cap_a, &mut pool_a,
+            coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx), 100_000_000, ctx.sender(), 9u256, &clk, &mut ctx);
+        assert!(a0 != al::settle_public_input_for_testing(&pool_a), 3);
+
+        coin::burn_for_testing(loan); test_utils::destroy(pos);
+        clock::destroy_for_testing(clk);
+        test_utils::destroy(pool_a); test_utils::destroy(cap_a);
+        test_utils::destroy(pool_b); test_utils::destroy(cap_b);
     }
 
     #[test]
@@ -590,9 +666,12 @@ module dregg_lending_async::async_lending_tests {
         assert!(al::is_paused(&pool), 1);
         al::set_paused(&cap, &mut pool, false, &mut ctx);
         assert!(!al::is_paused(&pool), 2);
-        // rotation invalidates every outstanding attestation signed by the old key
-        al::set_operator_pubkey(&cap, &mut pool, x"0202020202020202020202020202020202020202020202020202020202020202", &mut ctx);
-        assert!(!al::commit_used(&pool, 42u256), 3); // nothing disbursed yet
+        // rotation is proposed, then applied only after the timelock (audit R5)
+        al::propose_operator_pubkey(&cap, &mut pool, opk2(), &clk, &mut ctx);
+        let (pending, at) = al::pending_rotation(&pool);
+        assert!(pending == opk2() && at == 86_400, 3);
+        assert!(al::operator_pubkey_of(&pool) == opk(), 4); // NOT yet in effect
+        assert!(!al::commit_used(&pool, 42u256), 5);
         clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
     }
 }

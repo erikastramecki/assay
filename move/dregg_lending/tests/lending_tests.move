@@ -51,7 +51,7 @@ module dregg_lending::lending_tests {
         let mut ctx = tx_context::dummy();
         let mut pool = lending::create_pool<USDC>(coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), vk(), &mut ctx);
         let collateral = coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx);
-        let pid = lending::expected_payment_id(
+        let pid = lending::expected_payment_id<SSPX>(
             object::id(&pool), ctx.sender(), 50_000_000, 100_000_000_000, 5000, 7);
         let (loan, pos) = lending::borrow<SSPX, USDC>(
             &mut pool, collateral, 50_000_000, 5000, 7, pid, proof(), &mut ctx);
@@ -66,7 +66,7 @@ module dregg_lending::lending_tests {
     fun borrow_binds_the_actual_collateral_amount() {
         let mut ctx = tx_context::dummy();
         let mut pool = lending::create_pool<USDC>(coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), vk(), &mut ctx);
-        let pid = lending::expected_payment_id(
+        let pid = lending::expected_payment_id<SSPX>(
             object::id(&pool), ctx.sender(), 50_000_000, 100_000_000_000, 5000, 7);
         let short = coin::mint_for_testing<SSPX>(50_000_000_000, &mut ctx); // half of what was committed
         let (loan, pos) = lending::borrow<SSPX, USDC>(
@@ -82,13 +82,41 @@ module dregg_lending::lending_tests {
     fun borrow_binds_the_actual_debt() {
         let mut ctx = tx_context::dummy();
         let mut pool = lending::create_pool<USDC>(coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), vk(), &mut ctx);
-        let pid = lending::expected_payment_id(
+        let pid = lending::expected_payment_id<SSPX>(
             object::id(&pool), ctx.sender(), 50_000_000, 100_000_000_000, 5000, 7);
         let collateral = coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx);
         let (loan, pos) = lending::borrow<SSPX, USDC>(
             &mut pool, collateral, 900_000_000, 5000, 7, pid, proof(), &mut ctx);
         // unreachable
         coin::burn_for_testing(loan); test_utils::destroy(pos); test_utils::destroy(pool);
+    }
+
+    public struct JUNK has drop {} // a worthless coin the attacker publishes themselves
+
+    /// R5 REGRESSION — the collateral TYPE must be bound, not just the unit count. A proof issued
+    /// for 100e9 units of sSPX must NOT be redeemable with 100e9 units of a worthless coin.
+    #[test]
+    #[expected_failure(abort_code = lending::ETermsMismatch)]
+    fun borrow_rejects_substituted_collateral_type() {
+        let mut ctx = tx_context::dummy();
+        let mut pool = lending::create_pool<USDC>(coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), vk(), &mut ctx);
+        // commitment issued for SSPX collateral...
+        let pid = lending::expected_payment_id<SSPX>(
+            object::id(&pool), ctx.sender(), 50_000_000, 100_000_000_000, 5000, 7);
+        // ...redeemed with the same unit count of a junk coin. Must abort.
+        let junk = coin::mint_for_testing<JUNK>(100_000_000_000, &mut ctx);
+        let (loan, pos) = lending::borrow<JUNK, USDC>(
+            &mut pool, junk, 50_000_000, 5000, 7, pid, proof(), &mut ctx);
+        // unreachable
+        coin::burn_for_testing(loan); test_utils::destroy(pos); test_utils::destroy(pool);
+    }
+
+    #[test]
+    fun loan_commit_binds_the_collateral_type() {
+        let pool = object::id_from_address(@0xA11CE);
+        let a = lending::loan_commit_of<SSPX>(pool, @0xA11CE, 50_000_000, 100_000_000_000, 5000, 7);
+        let b = lending::loan_commit_of<JUNK>(pool, @0xA11CE, 50_000_000, 100_000_000_000, 5000, 7);
+        assert!(a != b, 0); // same terms, different collateral type -> different commitment
     }
 
     #[test]
@@ -98,16 +126,16 @@ module dregg_lending::lending_tests {
         let alice = @0xA11CE;
         let bob = @0xB0B;
 
-        let base = lending::loan_commit_of(pool, alice, 50_000_000, 100_000_000_000, 5000, 7);
+        let base = lending::loan_commit_of<SSPX>(pool, alice, 50_000_000, 100_000_000_000, 5000, 7);
         // deterministic
-        assert!(base == lending::loan_commit_of(pool, alice, 50_000_000, 100_000_000_000, 5000, 7), 0);
+        assert!(base == lending::loan_commit_of<SSPX>(pool, alice, 50_000_000, 100_000_000_000, 5000, 7), 0);
         // every economic term is bound — flipping any one changes the commitment
-        assert!(base != lending::loan_commit_of(pool2, alice, 50_000_000, 100_000_000_000, 5000, 7), 1); // pool
-        assert!(base != lending::loan_commit_of(pool, bob,   50_000_000, 100_000_000_000, 5000, 7), 2); // borrower
-        assert!(base != lending::loan_commit_of(pool, alice, 50_000_001, 100_000_000_000, 5000, 7), 3); // debt
-        assert!(base != lending::loan_commit_of(pool, alice, 50_000_000,  99_999_999_999, 5000, 7), 4); // collateral
-        assert!(base != lending::loan_commit_of(pool, alice, 50_000_000, 100_000_000_000, 5001, 7), 5); // LTV
-        assert!(base != lending::loan_commit_of(pool, alice, 50_000_000, 100_000_000_000, 5000, 8), 6); // nonce
+        assert!(base != lending::loan_commit_of<SSPX>(pool2, alice, 50_000_000, 100_000_000_000, 5000, 7), 1); // pool
+        assert!(base != lending::loan_commit_of<SSPX>(pool, bob,   50_000_000, 100_000_000_000, 5000, 7), 2); // borrower
+        assert!(base != lending::loan_commit_of<SSPX>(pool, alice, 50_000_001, 100_000_000_000, 5000, 7), 3); // debt
+        assert!(base != lending::loan_commit_of<SSPX>(pool, alice, 50_000_000,  99_999_999_999, 5000, 7), 4); // collateral
+        assert!(base != lending::loan_commit_of<SSPX>(pool, alice, 50_000_000, 100_000_000_000, 5001, 7), 5); // LTV
+        assert!(base != lending::loan_commit_of<SSPX>(pool, alice, 50_000_000, 100_000_000_000, 5000, 8), 6); // nonce
     }
 
     #[test]
@@ -116,7 +144,7 @@ module dregg_lending::lending_tests {
         let mut ctx = tx_context::dummy();
         let mut pool = lending::create_pool<USDC>(coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), vk(), &mut ctx);
         let c = coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx);
-        let pid = lending::expected_payment_id(
+        let pid = lending::expected_payment_id<SSPX>(
             object::id(&pool), ctx.sender(), 50_000_000, 100_000_000_000, 5000, 7);
         // a valid first borrow cannot be constructed without the re-proven fixture, so seed the
         // consumed nullifier directly; the second attempt must still be refused as a replay
@@ -134,7 +162,7 @@ module dregg_lending::lending_tests {
         let mut pool = lending::create_pool<USDC>(coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), vk(), &mut ctx);
         let collateral = coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx);
         let bad = x"bb171caeadbbc98aba5d2ef831676b1997a520b948296e7340ce6e2b1f64bf0e6cc6dfc3e82b5cbee3c09644533b07bb05d3fede6af6d05749f4e2d5824cfc17b0332ad583c14825518f20fb7b2ed5d89d885e1270ddd523291ee5f3a402e8a6d18f918c8358101dc140269a47a0657ce9ac1ca12af8b750b711a4db06e5b926";
-        let pid = lending::expected_payment_id(
+        let pid = lending::expected_payment_id<SSPX>(
             object::id(&pool), ctx.sender(), 50_000_000, 100_000_000_000, 5000, 7);
         let (loan, pos) = lending::borrow<SSPX, USDC>(&mut pool, collateral, 50_000_000, 5000, 7, pid, bad, &mut ctx);
         // unreachable — borrow aborts

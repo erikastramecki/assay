@@ -63,8 +63,12 @@ async function tick() {
       // borrower on-chain. Seize only what the debt plus the liquidation bonus is worth.
       const bonusBps = Number(process.env.LIQ_BONUS_BPS || 500); // 5%
       const seizeUsd = debt * (1 + bonusBps / 10000);
-      const seizeUnits = Math.min(Number(p.collateral), Math.ceil((seizeUsd / px) * 10 ** m.decimals));
-      const seizeAmount = BigInt(seizeUnits);
+      // Compute the cap in BigInt (audit R5): Number(p.collateral) loses precision above 2^53, so
+      // on a large 9-decimal position the rounded value could exceed the true balance and abort
+      // the liquidation with EBadSeize — the keeper would silently fail to liquidate.
+      const wanted = BigInt(Math.ceil((seizeUsd / px) * 10 ** m.decimals));
+      const seizeAmount = wanted < p.collateral ? wanted : p.collateral;
+      const seizeUnits = Number(seizeAmount);
       const expiryS = BigInt(Math.floor(Date.now() / 1000) + 90);
       const attestation = await signLiquidation(operator, {
         poolId: POOL, positionId: p.id, seizeAmount, expiryS,

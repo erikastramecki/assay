@@ -9,6 +9,7 @@ module dregg_lending::lending {
     use sui::coin::{Self, Coin};
     use sui::balance::{Self, Balance};
     use sui::table::{Self, Table};
+    use std::type_name::{Self};
     use dregg_verifier::verifier;
 
     const EBadProof: u64 = 0xBAD;
@@ -75,7 +76,7 @@ module dregg_lending::lending {
         ctx: &mut TxContext,
     ): (Coin<Stable>, Position<Collateral, Stable>) {
         // TERMS BINDING (audit F1): the proof must be FOR this loan, not merely valid.
-        let expected = loan_commit_of(
+        let expected = loan_commit_of<Collateral>(
             object::id(pool), ctx.sender(), debt, coin::value(&collateral), ltv_bps, nonce,
         );
         assert!(payment_id == sui::bcs::to_bytes(&expected), ETermsMismatch);
@@ -126,14 +127,24 @@ module dregg_lending::lending {
     // against this commitment over the actual terms. A re-proven fixture (public ==
     // loan_commit_of) is still required before the module can originate; see
     // perloan-prep/RUNBOOK-terms-binding.md.
-    public fun loan_commit_of(
+    public fun loan_commit_of<Collateral>(
         pool_id: ID, borrower: address, debt: u64, collateral: u64, ltv_bps: u64, nonce: u64,
     ): u256 {
         let (ph, pl) = split32(object::id_to_bytes(&pool_id));
         let (bh, bl) = split32(sui::address::to_bytes(borrower));
+        // SECURITY (audit R5): bind the collateral TYPE, not just the unit count. Without it a
+        // proof issued for 100e9 units of a valuable RWA is redeemable with 100e9 units of a
+        // worthless coin the attacker publishes themselves — every other committed term matches
+        // bit-for-bit, so the binding passes and real stablecoin leaves the pool against junk.
+        // async_lending::attest_msg has always bound the type for exactly this reason.
+        // Hashed to two <2^128 limbs so both are valid BN254 field elements, same as the ID split.
+        let (th, tl) = split32(sui::hash::blake2b256(
+            &type_name::into_string(type_name::get<Collateral>()).into_bytes(),
+        ));
         sui::poseidon::poseidon_bn254(&vector[
             ph, pl, bh, bl,
             (debt as u256), (collateral as u256), (ltv_bps as u256), (nonce as u256),
+            th, tl,
         ])
     }
 
@@ -156,10 +167,10 @@ module dregg_lending::lending {
     }
 
     /// The exact bytes `borrow` expects as `payment_id` for these terms.
-    public fun expected_payment_id(
+    public fun expected_payment_id<Collateral>(
         pool_id: ID, borrower: address, debt: u64, collateral: u64, ltv_bps: u64, nonce: u64,
     ): vector<u8> {
-        sui::bcs::to_bytes(&loan_commit_of(pool_id, borrower, debt, collateral, ltv_bps, nonce))
+        sui::bcs::to_bytes(&loan_commit_of<Collateral>(pool_id, borrower, debt, collateral, ltv_bps, nonce))
     }
 
     public fun pool_liquidity<Stable>(p: &Pool<Stable>): u64 { balance::value(&p.liquidity) }

@@ -34,7 +34,19 @@ module dregg_lending_async::async_lending {
     const EBadPubkey: u64 = 0xC0B;      // operator pubkey must be 32 bytes and not a low-order point (R2-3)
     const EBadCurve: u64 = 0xC0C;       // rate curve parameters would overflow accrual (audit R2-2)
     const EBadSeize: u64 = 0xC0D;       // liquidation would seize more than the position's collateral
-    const ENotUnderwater: u64 = 0xC0E;  // liquidation attestation missing/invalid (audit F3)
+    const EBadLiqAttest: u64 = 0xC0E;   // liquidation attestation missing/invalid — NOT a health
+                                        // check; this module has no on-chain oracle (audit F3/R5)
+    const ENoPendingKey: u64 = 0xC0F;   // no operator-key rotation has been proposed
+    const ERotationEarly: u64 = 0xC10;  // rotation timelock has not elapsed (audit R5)
+
+    /// Delay between proposing an operator-key rotation and it taking effect.
+    ///
+    /// SECURITY (audit R5): rotation and liquidation were both gated on the SAME OperatorCap with
+    /// no delay, so a cap holder could rotate the signing key to one they control and self-sign a
+    /// liquidation attestation IN THE SAME PTB — collapsing the two-party requirement F3 was
+    /// written to create back into one. The timelock makes that atomic path impossible: a rotation
+    /// is visible on-chain for a full day before it can authorise anything.
+    const ROTATION_DELAY_S: u64 = 86_400;
 
     /// DOMAIN SEPARATION (audit F3). Two different things are now signed by the same operator key.
     /// Without a distinct prefix per message type, a disburse attestation and a liquidation
@@ -189,6 +201,9 @@ module dregg_lending_async::async_lending {
         // Without this an attestation is a bearer instrument redeemable an unbounded number of
         // times. Mirrors `dregg_lending::lending`'s `used` nullifier table, which was already correct.
         used_commits: Table<u256, bool>,
+        // Timelocked operator-key rotation (audit R5). Empty pending key = no rotation in flight.
+        pending_pubkey: vector<u8>,
+        pending_pubkey_at: u64,
         // PAUSE (audit F2.4): kill-switch for the attested path. There was previously no way to
         // revoke outstanding attestations after an operator-key compromise.
         paused: bool,
@@ -303,6 +318,8 @@ module dregg_lending_async::async_lending {
             collateral_borrowed: table::new(ctx),
             per_collateral_cap,
             used_commits: table::new(ctx),
+            pending_pubkey: vector::empty(),
+            pending_pubkey_at: 0,
             paused: false,
         };
         let cap_obj = OperatorCap { id: object::new(ctx), pool_id: object::id(&pool) };
@@ -554,12 +571,40 @@ module dregg_lending_async::async_lending {
     /// GOVERNANCE (OperatorCap-gated): rotate the pinned operator pubkey. Rotating invalidates
     /// every outstanding attestation signed by the old key — the revocation path that did not
     /// exist before the audit (F2.4). Use together with `set_paused` on a suspected key compromise.
-    public entry fun set_operator_pubkey<Stable>(
-        cap: &OperatorCap, pool: &mut Pool<Stable>, operator_pubkey: vector<u8>, _ctx: &mut TxContext,
+    public entry fun propose_operator_pubkey<Stable>(
+        cap: &OperatorCap, pool: &mut Pool<Stable>, operator_pubkey: vector<u8>, clock: &Clock, _ctx: &mut TxContext,
     ) {
         assert_cap(cap, pool);
         assert_valid_pubkey(&operator_pubkey);
-        pool.operator_pubkey = operator_pubkey;
+        pool.pending_pubkey = operator_pubkey;
+        pool.pending_pubkey_at = now_s(clock) + ROTATION_DELAY_S;
+    }
+
+    /// Apply a rotation proposed at least ROTATION_DELAY_S ago. Split from the proposal so a cap
+    /// holder cannot rotate the key and use it in the same transaction (audit R5).
+    public entry fun commit_operator_pubkey<Stable>(
+        cap: &OperatorCap, pool: &mut Pool<Stable>, clock: &Clock, _ctx: &mut TxContext,
+    ) {
+        assert_cap(cap, pool);
+        assert!(!vector::is_empty(&pool.pending_pubkey), ENoPendingKey);
+        assert!(now_s(clock) >= pool.pending_pubkey_at, ERotationEarly);
+        pool.operator_pubkey = pool.pending_pubkey;
+        pool.pending_pubkey = vector::empty();
+        pool.pending_pubkey_at = 0;
+    }
+
+    /// Abandon an in-flight rotation (e.g. the proposed key was wrong, or the compromise passed).
+    public entry fun cancel_operator_pubkey_rotation<Stable>(
+        cap: &OperatorCap, pool: &mut Pool<Stable>, _ctx: &mut TxContext,
+    ) {
+        assert_cap(cap, pool);
+        pool.pending_pubkey = vector::empty();
+        pool.pending_pubkey_at = 0;
+    }
+
+    /// The pending rotation, if any: (pubkey, earliest effective time).
+    public fun pending_rotation<Stable>(p: &Pool<Stable>): (vector<u8>, u64) {
+        (p.pending_pubkey, p.pending_pubkey_at)
     }
 
     /// GOVERNANCE (OperatorCap-gated): pause/unpause the attested disburse path (F2.4).
@@ -571,6 +616,25 @@ module dregg_lending_async::async_lending {
         assert_cap(cap, pool);
         pool.paused = paused;
     }
+
+    /// The batch proof's public input: four BN254 scalars. Factored out so its encoding can be
+    /// pinned by test — deleting the pool or batch binding used to leave the whole suite green.
+    fun settle_public_input<Stable>(pool: &Pool<Stable>): vector<u8> {
+        let (pool_hi, pool_lo) = split32(object::id_to_bytes(&object::id(pool)));
+        let mut pi = sui::bcs::to_bytes(&pool_hi);
+        vector::append(&mut pi, sui::bcs::to_bytes(&pool_lo));
+        vector::append(&mut pi, sui::bcs::to_bytes(&(pool.current_batch as u256)));
+        vector::append(&mut pi, sui::bcs::to_bytes(&pool.batch_root));
+        pi
+    }
+
+    #[test_only]
+    public fun settle_public_input_for_testing<Stable>(pool: &Pool<Stable>): vector<u8> {
+        settle_public_input(pool)
+    }
+
+    #[test_only]
+    public fun set_current_batch_for_testing<Stable>(pool: &mut Pool<Stable>, b: u64) { pool.current_batch = b; }
 
     /// Split a 32-byte big-endian value into (high 16 bytes, low 16 bytes) as u256, each < 2^128
     /// < the BN254 scalar field, so both are valid field elements. Mirrors the helper in
@@ -591,6 +655,8 @@ module dregg_lending_async::async_lending {
 
     /// Is the attested disburse path currently paused?
     public fun is_paused<Stable>(pool: &Pool<Stable>): bool { pool.paused }
+
+    public fun operator_pubkey_of<Stable>(p: &Pool<Stable>): vector<u8> { p.operator_pubkey }
 
     /// Lets the replay test seed a consumed commit without needing a valid ed25519 signature
     /// (which cannot be produced inside a Move test). The audit flagged EAttestReplay as the
@@ -644,12 +710,21 @@ module dregg_lending_async::async_lending {
     }
 
     /// Release a closed loan's principal from its collateral's isolation bucket.
+    /// Release a closed loan's principal from BOTH exposure ledgers.
+    ///
+    /// SECURITY/LIVENESS (audit R5): `total_pending` used to be released only by `settle_batch`.
+    /// Once F4 made settlement require a re-proven circuit, that made it monotonic over the pool's
+    /// entire lifetime — so `assert!(total_pending <= pool.cap, EOverCap)` in disburse_inner would
+    /// permanently brick ALL borrowing once cumulative volume crossed the cap, even though every
+    /// one of those loans had been repaid. A repaid loan is not unproven exposure, so it is
+    /// released here alongside the per-collateral bucket.
     fun release_exposure<Collateral, Stable>(pool: &mut Pool<Stable>, principal: u64) {
         let ct = type_name::get<Collateral>();
         if (table::contains(&pool.collateral_borrowed, ct)) {
             let cur = *table::borrow(&pool.collateral_borrowed, ct);
             *table::borrow_mut(&mut pool.collateral_borrowed, ct) = if (cur > principal) { cur - principal } else { 0 };
         };
+        pool.total_pending = if (pool.total_pending > principal) { pool.total_pending - principal } else { 0 };
     }
 
     /// Borrower repays principal+interest, reclaims collateral, closes the position.
@@ -725,7 +800,7 @@ module dregg_lending_async::async_lending {
         let msg = liq_attest_msg<Collateral, Stable>(
             object::id(pool), object::id(&pos), seize_amount, expiry_s,
         );
-        assert!(sui::ed25519::ed25519_verify(&attestation, &pool.operator_pubkey, &msg), ENotUnderwater);
+        assert!(sui::ed25519::ed25519_verify(&attestation, &pool.operator_pubkey, &msg), EBadLiqAttest);
         liquidate_body<Collateral, Stable>(pool, pos, payment, seize_amount, now, ctx)
     }
 
@@ -766,7 +841,7 @@ module dregg_lending_async::async_lending {
         liquidate_body<Collateral, Stable>(pool, pos, payment, seize_amount, now, ctx)
     }
 
-    /// Permissionless batch settle: the batch proof must verify against the on-chain
+    /// Operator batch settle: the batch proof must verify against the on-chain
     /// Poseidon accumulator (reconciliation). On success the batch finalizes, exposure
     /// frees, a fresh batch opens.
     /// SECURITY (audit F4, was HIGH): this was permissionless and its only public input was
@@ -789,12 +864,7 @@ module dregg_lending_async::async_lending {
         // Four BN254 scalars, 32 bytes each — groth16 requires len % 32 == 0, and a raw 32-byte
         // object ID can exceed the field modulus, so the pool ID is split into two <2^128 limbs
         // (the same convention as dregg_lending::lending::loan_commit_of).
-        let (pool_hi, pool_lo) = split32(object::id_to_bytes(&object::id(pool)));
-        let mut public_input = sui::bcs::to_bytes(&pool_hi);
-        vector::append(&mut public_input, sui::bcs::to_bytes(&pool_lo));
-        vector::append(&mut public_input, sui::bcs::to_bytes(&(pool.current_batch as u256)));
-        vector::append(&mut public_input, sui::bcs::to_bytes(&pool.batch_root));
-        assert!(verifier::verify(pool.vk, public_input, proof), EBadProof);
+        assert!(verifier::verify(pool.vk, settle_public_input(pool), proof), EBadProof);
         pool.last_settled = pool.current_batch;
         pool.current_batch = pool.current_batch + 1;
         pool.batch_root = 0;
