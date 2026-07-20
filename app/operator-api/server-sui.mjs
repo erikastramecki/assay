@@ -52,8 +52,13 @@ if (!/^0x[0-9a-fA-F]{1,64}$/.test(POOL_ID)) throw new Error("POOL_ID must be set
 if (!/^0x[0-9a-fA-F]{1,64}::[^:]+::.+$/.test(STABLE_TYPE)) throw new Error("STABLE_TYPE must be set to the pool's stable coin type (audit F2.3)");
 // AUDIT F2.1 — attestation lifetime in seconds. Must stay <= MAX_ATTEST_WINDOW_S (120) in
 // async_lending.move, and wants headroom for the borrower to sign in their wallet.
-const ATTEST_TTL_S = Number(process.env.ATTEST_TTL_S || 90);
-if (ATTEST_TTL_S > 120) throw new Error("ATTEST_TTL_S exceeds the contract's MAX_ATTEST_WINDOW_S (120)");
+// Validate positively (audit R2-4): `Number("abc")` is NaN and `NaN > 120` is false, so a bare
+// upper-bound check reports success on exactly the misconfiguration it exists to catch — the
+// server boots, /health returns ok, and every /borrow fails.
+const ATTEST_TTL_S = Number(process.env.ATTEST_TTL_S ?? 90);
+if (!Number.isInteger(ATTEST_TTL_S) || ATTEST_TTL_S <= 0 || ATTEST_TTL_S > 120) {
+  throw new Error(`ATTEST_TTL_S must be an integer in 1..120 (contract MAX_ATTEST_WINDOW_S); got ${JSON.stringify(process.env.ATTEST_TTL_S)}`);
+}
 
 // Server owns the risk params (audit CRITICAL-2). On Sui a "collateral mint" is a Coin TYPE.
 //   COLLATERAL_REGISTRY = { "<pkg>::<mod>::<TYPE>": { "feedId":"0x…", "ltvBps":4000, "decimals":8 } }

@@ -27,6 +27,19 @@ if [ "$run_test" = 1 ]; then echo "── preflight: sui move test ──"
 # ---- operator ----
 if [ "$do_op" = 1 ]; then
   echo "── operator: bundle + deploy ──"
+  # The operator now REFUSES TO BOOT without POOL_ID/STABLE_TYPE (audit F2.3) — a module-load throw
+  # 500s every route including /health. Provision them from the web build config so the app and the
+  # operator can never disagree about which pool they're on, and fail loudly if they're missing.
+  POOL_ID=$(grep -E '^VITE_POOL=' "$WEB/.env.production" 2>/dev/null | cut -d= -f2-)
+  STABLE_TYPE=$(grep -E '^VITE_STABLE_TYPE=' "$WEB/.env.production" 2>/dev/null | cut -d= -f2-)
+  [ -z "$POOL_ID" ] && fail "VITE_POOL missing from $WEB/.env.production (operator cannot boot without POOL_ID)"
+  [ -z "$STABLE_TYPE" ] && fail "VITE_STABLE_TYPE missing from $WEB/.env.production"
+  ( cd "$OPV"
+    vercel env rm POOL_ID production --yes >/dev/null 2>&1
+    printf '%s' "$POOL_ID" | vercel env add POOL_ID production --force >/dev/null 2>&1 || exit 1
+    vercel env rm STABLE_TYPE production --yes >/dev/null 2>&1
+    printf '%s' "$STABLE_TYPE" | vercel env add STABLE_TYPE production --force >/dev/null 2>&1 || exit 1
+  ) || fail "could not provision POOL_ID/STABLE_TYPE on the operator project"
   ( cd "$OPDIR" && ./node_modules/.bin/esbuild server-sui.mjs --bundle --platform=node --format=esm --target=node20 \
       --outfile=assay-operator/api/index.mjs --log-level=error --banner:js="$BANNER" ) || fail "operator bundle failed"
   U=$( cd "$OPV" && vercel deploy --prod --yes 2>/dev/null | grep -oE "https://assay-operator-[a-z0-9-]+\.vercel\.app" | head -1 )
@@ -46,6 +59,13 @@ fi
 
 # ---- smoke ----
 echo "── smoke check ──"
-[ "$do_op" = 1 ]  && echo "   operator /health → $(curl -s -o /dev/null -w '%{http_code}' https://$OP_ALIAS/health)"
-[ "$do_web" = 1 ] && echo "   web → $(curl -s -o /dev/null -w '%{http_code}' https://$WEB_ALIAS)"
+# Smoke checks must FAIL the deploy on a bad status (audit R2). Previously these only printed the
+# code, so a 500 from a crashed operator was followed by "✅ deploy complete" and exit 0.
+smoke() { # smoke <label> <url>
+  local code; code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$2")
+  echo "   $1 → $code"
+  [ "$code" = "200" ] || fail "$1 smoke check returned $code (expected 200)"
+}
+[ "$do_op" = 1 ]  && smoke "operator /health" "https://$OP_ALIAS/health"
+[ "$do_web" = 1 ] && smoke "web" "https://$WEB_ALIAS"
 echo "✅ deploy complete"

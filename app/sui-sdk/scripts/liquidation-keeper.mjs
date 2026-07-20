@@ -10,7 +10,7 @@ import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import { Transaction } from "@mysten/sui/transactions";
 import { readFileSync } from "node:fs";
 import os from "node:os";
-import { ptb, exactCoin, readPool, allOpenPositions, accrueIndex, currentDebt } from "../src/index.ts";
+import { ptb, exactCoin, readPool, allOpenPositions, accrueIndex, currentDebt, operatorPubkeyBytes } from "../src/index.ts";
 import { fetchPythPrice, applyOraclePolicy } from "../../../operator/pyth.mjs";
 
 const HOME = os.homedir();
@@ -67,7 +67,7 @@ if (DEMO) {
   const sol = markets.markets.find((m) => m.sym === "SOL"), solType = ctOf(sol);
   await exec((() => { const t = new Transaction(); t.moveCall({ target: `${COINS}::tusdc::mint`, arguments: [t.object(CAP_USDC), t.pure.u64(300_000_000n), t.pure.address(me)] }); return t; })(), capOwner);
   await exec((() => { const t = new Transaction(); t.moveCall({ target: sol.mintTarget, arguments: [t.object(sol.cap), t.pure.u64(1_000_000_000n), t.pure.address(me)] }); return t; })(), capOwner);
-  { const t = new Transaction(); ptb.initPool(t, { pkg: LENDING, stableType: STABLE, curve: { baseBps: 0, slope1Bps: 0, slope2Bps: 0, kinkBps: 8000, reserveBps: 0 }, cap: 1_000_000_000_000n, perCollateralCap: 0n, vk: VK, operatorPubkey: new Uint8Array(32) });
+  { const t = new Transaction(); ptb.initPool(t, { pkg: LENDING, stableType: STABLE, curve: { baseBps: 0, slope1Bps: 0, slope2Bps: 0, kinkBps: 8000, reserveBps: 0 }, cap: 1_000_000_000_000n, perCollateralCap: 0n, vk: VK, operatorPubkey: operatorPubkeyBytes(new Ed25519Keypair()) });
     const r = await exec(t); POOL = created(r, "async_lending::Pool"); OPCAP = created(r, "async_lending::OperatorCap"); }
   { const t = new Transaction(); const c = await exactCoin(t, client, me, STABLE, 200_000_000n); ptb.deposit(t, { pkg: LENDING, stableType: STABLE, pool: POOL, coin: c }); await exec(t); }
   // underwater by construction: 1 SOL (~$77) collateral, $70 debt → threshold $77·72% = $55 < $70

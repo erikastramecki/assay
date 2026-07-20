@@ -267,6 +267,72 @@ module dregg_lending_async::async_lending_tests {
     /// The expected bytes below were emitted by `app/sui-sdk/src/attest.ts::attestationMessage`
     /// for these exact inputs. If this test fails, the two layouts have drifted apart — fix the
     /// mismatch, do NOT re-baseline this constant to whatever Move currently produces.
+    // ---- audit R2 regressions -------------------------------------------------------------
+
+    #[test]
+    #[expected_failure(abort_code = al::EAttestReplay)]
+    fun disburse_attested_rejects_replayed_commit() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        // commit 42 has already been disbursed; the same attestation must never work twice
+        al::mark_commit_used_for_testing(&mut pool, 42u256);
+        al::disburse_attested<SSPX, USDC>(
+            &mut pool, coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx),
+            500_000_000, 42u256, 60, FORGED, &clk, &mut ctx);
+        // unreachable
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = al::EWrongPool)]
+    fun foreign_operator_cap_cannot_govern_another_pool() {
+        let mut ctx = tx_context::dummy();
+        let (mut victim, victim_cap, clk) = attest_fixture(0, &mut ctx);
+        // init_pool is permissionless, so an attacker mints their OWN pool + cap for free...
+        let (attacker_pool, attacker_cap) = al::new_pool<USDC>(0, 0, 0, 8000, 0, 1, 0, vk(), opk(), &clk, &mut ctx);
+        // ...and points it at the victim pool to seize the signing key. Must abort.
+        al::set_operator_pubkey(&attacker_cap, &mut victim, x"0202020202020202020202020202020202020202020202020202020202020202", &mut ctx);
+        // unreachable
+        clock::destroy_for_testing(clk);
+        test_utils::destroy(victim); test_utils::destroy(victim_cap);
+        test_utils::destroy(attacker_pool); test_utils::destroy(attacker_cap);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = al::EBadCurve)]
+    fun rate_curve_rejects_bricking_rate() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        // an absurd base rate would make accrue's u256->u64 downcast abort forever, wedging
+        // every entrypoint including the repair tx. A plain operator typo reaches this.
+        al::set_rate_curve(&cap, &mut pool, 18_446_744_073_709_551_615, 0, 0, 8000, 0, &clk, &mut ctx);
+        // unreachable
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = al::EBadPubkey)]
+    fun new_pool_rejects_all_zero_pubkey() {
+        let mut ctx = tx_context::dummy();
+        let clk = clock::create_for_testing(&mut ctx);
+        // 0x00*32 is a low-order point: Sui's ZIP-215 ed25519_verify accepts ANY signature against
+        // it, so this key turns the protocol's only solvency gate into a no-op.
+        let (pool, cap) = al::new_pool<USDC>(0, 0, 0, 8000, 0, 1_000, 0, vk(),
+            x"0000000000000000000000000000000000000000000000000000000000000000", &clk, &mut ctx);
+        // unreachable
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = al::EBadPubkey)]
+    fun rotation_rejects_wrong_length_pubkey() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        al::set_operator_pubkey(&cap, &mut pool, x"0202", &mut ctx); // truncated paste
+        // unreachable
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
     #[test]
     fun attest_msg_matches_typescript_byte_for_byte() {
         let expected: vector<u8> = x"00000000000000000000000000000000000000000000000000000000000000bb0065cd1d0000000000e87648170000002a000000000000000000000000000000000000000000000000000000000000003c0000000000000000000000000000000000000000000000000000000000000000000000000000aa5b303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303a3a6173796e635f6c656e64696e675f74657374733a3a535350585b303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303a3a6173796e635f6c656e64696e675f74657374733a3a55534443";

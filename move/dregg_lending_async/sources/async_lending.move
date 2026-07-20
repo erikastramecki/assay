@@ -30,19 +30,73 @@ module dregg_lending_async::async_lending {
     const EAttestReplay: u64 = 0xA79;   // this loan_commit was already disbursed (audit F2.2)
     const EPaused: u64 = 0xA7A;         // pool is paused; attested disburse disabled (audit F2.4)
     const EAttestWindow: u64 = 0xA7B;   // expiry_s is further out than MAX_ATTEST_WINDOW_S
+    const EWrongPool: u64 = 0xC0A;      // this OperatorCap was minted for a different pool (audit R2-1)
+    const EBadPubkey: u64 = 0xC0B;      // operator pubkey must be 32 bytes and not a low-order point (R2-3)
+    const EBadCurve: u64 = 0xC0C;       // rate curve parameters would overflow accrual (audit R2-2)
 
     /// Longest life an attestation may be signed for. The operator's oracle discipline
     /// (pyth.mjs: maxStaleSecs 60) only constrains the INSTANT of signing, so the on-chain
     /// window must be short or a signature becomes an option on a stale price (audit F2).
     const MAX_ATTEST_WINDOW_S: u64 = 120;
 
+    /// Ceiling on any single curve leg, in bps. `accrue` scales total_borrows by
+    /// (1 + rate*dt/BPS/YEAR); an unbounded `rate` makes the u256->u64 downcast ABORT (Move casts
+    /// abort, they don't wrap), and every state-changing entrypoint calls accrue first — so a bad
+    /// curve permanently bricks deposit/withdraw/repay/liquidate/disburse. 100_000 bps = 1000% APR,
+    /// far above any real curve and far below the overflow threshold. (audit R2-2)
+    const MAX_RATE_BPS: u64 = 100_000;
+
     const INDEX_ONE: u256 = 1_000_000_000_000_000_000; // 1e18 fixed-point
     const SECS_PER_YEAR: u256 = 31_536_000;
     const BPS: u256 = 10_000;
     const BPS_U64: u64 = 10_000;
 
-    /// Whoever holds this is the dregg operator (disburse + liquidate attestation).
-    public struct OperatorCap has key, store { id: UID }
+    /// Whoever holds this is the dregg operator for ONE pool (disburse + liquidate + governance).
+    ///
+    /// SECURITY (audit R2-1): `pool_id` binds the cap to the pool it was minted for. `init_pool` is
+    /// permissionless, so without this binding anyone could mint their own cap and point it at
+    /// someone else's pool — rotating its operator key, unpausing it, disbursing without an
+    /// attestation, or liquidating healthy positions. The sibling `dregg_lending::lending` module
+    /// already binds by pool id; this module was missing the same guard.
+    public struct OperatorCap has key, store { id: UID, pool_id: ID }
+
+    /// Every cap-gated entrypoint must call this first. A cap is authority over ONE pool.
+    fun assert_cap<Stable>(cap: &OperatorCap, pool: &Pool<Stable>) {
+        assert!(cap.pool_id == object::id(pool), EWrongPool);
+    }
+
+    /// An operator pubkey must be a 32-byte ed25519 key that is not a low-order point.
+    ///
+    /// SECURITY (audit R2-3): Sui's `ed25519_verify` is ZIP-215 (cofactored), which ACCEPTS a
+    /// forged signature against a low-order public key — `[8][k]A` is the identity, so the message
+    /// drops out of the equation and ANY signature verifies for ANY message. The all-zero key is
+    /// the canonical case and is easy to install by accident (unset env var, truncated paste, an
+    /// HSM returning null). A wrong-length key at least fails closed; a low-order key fails OPEN.
+    /// The eight low-order points of Curve25519 in compressed form:
+    fun assert_valid_pubkey(pk: &vector<u8>) {
+        assert!(vector::length(pk) == 32, EBadPubkey);
+        let low_order = vector[
+            x"0000000000000000000000000000000000000000000000000000000000000000",
+            x"0100000000000000000000000000000000000000000000000000000000000000",
+            x"ECFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF7F",
+            x"0000000000000000000000000000000000000000000000000000000000000080",
+            x"0100000000000000000000000000000000000000000000000000000000000080",
+            x"26E8958FC2B227B045C3F489F2EF98F0D5DFAC05D3C63339B13802886D53FC05",
+            x"C7176A703D4DD84FBA3C0B760D10670F2A2053FA2C39CCC64EC7FD7792AC037A",
+            x"ECFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+        ];
+        let mut i = 0;
+        while (i < vector::length(&low_order)) {
+            assert!(pk != vector::borrow(&low_order, i), EBadPubkey);
+            i = i + 1;
+        };
+    }
+
+    /// Curve legs must be bounded or `accrue` can abort forever (audit R2-2).
+    fun assert_valid_curve(base_bps: u64, slope1_bps: u64, slope2_bps: u64, kink_bps: u64, reserve_bps: u64) {
+        assert!(kink_bps > 0 && kink_bps < BPS_U64 && reserve_bps <= BPS_U64, EBadKink);
+        assert!(base_bps <= MAX_RATE_BPS && slope1_bps <= MAX_RATE_BPS && slope2_bps <= MAX_RATE_BPS, EBadCurve);
+    }
 
     /// Emitted when a loan opens — lets indexers/SDK discover shared Positions by borrower.
     public struct LoanOpened has copy, drop { position: ID, borrower: address, principal: u64 }
@@ -129,9 +183,22 @@ module dregg_lending_async::async_lending {
             let num = denom + (rate as u256) * dt;
             pool.borrow_index = pool.borrow_index * num / denom;
             let tb_old = pool.total_borrows;
-            pool.total_borrows = (((tb_old as u256) * num / denom) as u64);
+            // SATURATE, don't abort (audit R2-2). Move's u256->u64 cast ABORTS on overflow, and
+            // every state-changing entrypoint calls accrue first — so an overflowing accrual would
+            // brick deposit/withdraw/repay/liquidate permanently, unrecoverably (set_rate_curve
+            // itself calls accrue before applying the new curve, so even the repair tx would die).
+            // assert_valid_curve makes this unreachable; saturating means a future curve bug costs
+            // accounting precision instead of trapping every lender's funds forever.
+            let max_u64 = 18_446_744_073_709_551_615u256;
+            let tb_scaled = (tb_old as u256) * num / denom;
+            pool.total_borrows = if (tb_scaled > max_u64) { 18_446_744_073_709_551_615 } else { (tb_scaled as u64) };
             let interest = pool.total_borrows - tb_old;
-            pool.total_reserves = pool.total_reserves + interest * pool.reserve_bps / BPS_U64;
+            // Widen to u256 before multiplying: `interest * reserve_bps` can overflow u64 on its
+            // own. Dividing first would be wrong (any interest < BPS truncates the cut to zero),
+            // so the whole expression is evaluated in u256 and saturated on the way back down.
+            let res_add = (interest as u256) * (pool.reserve_bps as u256) / BPS;
+            let res_new = (pool.total_reserves as u256) + res_add;
+            pool.total_reserves = if (res_new > max_u64) { 18_446_744_073_709_551_615 } else { (res_new as u64) };
         };
         pool.last_accrual_s = now;
     }
@@ -149,7 +216,8 @@ module dregg_lending_async::async_lending {
         base_bps: u64, slope1_bps: u64, slope2_bps: u64, kink_bps: u64, reserve_bps: u64,
         cap: u64, per_collateral_cap: u64, vk: vector<u8>, operator_pubkey: vector<u8>, clock: &Clock, ctx: &mut TxContext,
     ): (Pool<Stable>, OperatorCap) {
-        assert!(kink_bps > 0 && kink_bps < BPS_U64 && reserve_bps <= BPS_U64, EBadKink);
+        assert_valid_curve(base_bps, slope1_bps, slope2_bps, kink_bps, reserve_bps);
+        assert_valid_pubkey(&operator_pubkey);
         let pool = Pool<Stable> {
             id: object::new(ctx),
             liquidity: balance::zero<Stable>(),
@@ -172,7 +240,8 @@ module dregg_lending_async::async_lending {
             used_commits: table::new(ctx),
             paused: false,
         };
-        (pool, OperatorCap { id: object::new(ctx) })
+        let cap_obj = OperatorCap { id: object::new(ctx), pool_id: object::id(&pool) };
+        (pool, cap_obj)
     }
 
     /// Create + share an empty pool, minting the OperatorCap to the sender.
@@ -186,7 +255,8 @@ module dregg_lending_async::async_lending {
     }
 
     /// GOVERNANCE (OperatorCap-gated): set the per-collateral isolation cap on a live pool.
-    public entry fun set_collateral_cap<Stable>(_cap: &OperatorCap, pool: &mut Pool<Stable>, per_collateral_cap: u64, _ctx: &mut TxContext) {
+    public entry fun set_collateral_cap<Stable>(cap: &OperatorCap, pool: &mut Pool<Stable>, per_collateral_cap: u64, _ctx: &mut TxContext) {
+        assert_cap(cap, pool);
         pool.per_collateral_cap = per_collateral_cap;
     }
 
@@ -194,11 +264,12 @@ module dregg_lending_async::async_lending {
     /// Accrues pending interest at the OLD curve first, so past interest is settled fairly, then
     /// applies the new one. Emits `CurveUpdated`.
     public entry fun set_rate_curve<Stable>(
-        _cap: &OperatorCap, pool: &mut Pool<Stable>,
+        cap: &OperatorCap, pool: &mut Pool<Stable>,
         base_bps: u64, slope1_bps: u64, slope2_bps: u64, kink_bps: u64, reserve_bps: u64,
         clock: &Clock, _ctx: &mut TxContext,
     ) {
-        assert!(kink_bps > 0 && kink_bps < BPS_U64 && reserve_bps <= BPS_U64, EBadKink);
+        assert_cap(cap, pool);
+        assert_valid_curve(base_bps, slope1_bps, slope2_bps, kink_bps, reserve_bps);
         accrue(pool, now_s(clock)); // settle interest accrued under the old curve before switching
         pool.base_bps = base_bps;
         pool.slope1_bps = slope1_bps;
@@ -288,7 +359,7 @@ module dregg_lending_async::async_lending {
 
     /// Cap-gated disburse (operator holds the OperatorCap) — the two-party/core path.
     public fun disburse<Collateral, Stable>(
-        _cap: &OperatorCap,
+        cap: &OperatorCap,
         pool: &mut Pool<Stable>,
         collateral: Coin<Collateral>,
         debt: u64,
@@ -297,6 +368,7 @@ module dregg_lending_async::async_lending {
         clock: &Clock,
         ctx: &mut TxContext,
     ): (Coin<Stable>, Position<Collateral, Stable>) {
+        assert_cap(cap, pool);
         disburse_inner<Collateral, Stable>(pool, collateral, debt, borrower, loan_commit, clock, ctx)
     }
 
@@ -392,8 +464,10 @@ module dregg_lending_async::async_lending {
     /// every outstanding attestation signed by the old key — the revocation path that did not
     /// exist before the audit (F2.4). Use together with `set_paused` on a suspected key compromise.
     public entry fun set_operator_pubkey<Stable>(
-        _cap: &OperatorCap, pool: &mut Pool<Stable>, operator_pubkey: vector<u8>, _ctx: &mut TxContext,
+        cap: &OperatorCap, pool: &mut Pool<Stable>, operator_pubkey: vector<u8>, _ctx: &mut TxContext,
     ) {
+        assert_cap(cap, pool);
+        assert_valid_pubkey(&operator_pubkey);
         pool.operator_pubkey = operator_pubkey;
     }
 
@@ -401,8 +475,9 @@ module dregg_lending_async::async_lending {
     /// Deliberately does NOT block `repay` or withdrawals — a pause must never trap borrowers'
     /// collateral or lenders' funds.
     public entry fun set_paused<Stable>(
-        _cap: &OperatorCap, pool: &mut Pool<Stable>, paused: bool, _ctx: &mut TxContext,
+        cap: &OperatorCap, pool: &mut Pool<Stable>, paused: bool, _ctx: &mut TxContext,
     ) {
+        assert_cap(cap, pool);
         pool.paused = paused;
     }
 
@@ -413,6 +488,14 @@ module dregg_lending_async::async_lending {
 
     /// Is the attested disburse path currently paused?
     public fun is_paused<Stable>(pool: &Pool<Stable>): bool { pool.paused }
+
+    /// Lets the replay test seed a consumed commit without needing a valid ed25519 signature
+    /// (which cannot be produced inside a Move test). The audit flagged EAttestReplay as the
+    /// least-verified guard in the F2 fix — this closes that gap with a real unit test.
+    #[test_only]
+    public fun mark_commit_used_for_testing<Stable>(pool: &mut Pool<Stable>, loan_commit: u256) {
+        table::add(&mut pool.used_commits, loan_commit, true);
+    }
 
     /// Exposes the signed preimage so the cross-language byte-equality test can pin it against
     /// `app/sui-sdk/src/attest.ts`. A divergence there fails every signature closed, but silently.
@@ -460,9 +543,10 @@ module dregg_lending_async::async_lending {
     /// repays the current debt into the pool and seizes the collateral. Async-aware —
     /// does NOT wait for batch settle.
     public fun liquidate<Collateral, Stable>(
-        _cap: &OperatorCap,
+        cap: &OperatorCap,
         pool: &mut Pool<Stable>, pos: Position<Collateral, Stable>, payment: Coin<Stable>, clock: &Clock, ctx: &mut TxContext,
     ): Coin<Collateral> {
+        assert_cap(cap, pool);
         accrue(pool, now_s(clock));
         let owed = debt_now(pool, &pos);
         assert!(coin::value(&payment) == owed, EWrongRepay);
