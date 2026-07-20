@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Blocks commits containing secrets. Bypass (only if you're sure): git commit --no-verify
+set -uo pipefail
+
+fail=0
+red()  { printf '\033[31m%s\033[0m\n' "$*"; }
+warn() { printf '\033[33m%s\033[0m\n' "$*"; }
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+# --- 1. forbidden filenames, even if .gitignore is bypassed with `git add -f` ---
+bad_names=$(printf '%s\n' "$staged" | grep -iE '(^|/)\.env($|\.)|\.key$|\.pem$|\.p12$|\.jks$|id_rsa|keypair\.json$|keystore|(^|/)\.operator[^/]*\.(key|json)$' || true)
+if [ -n "$bad_names" ]; then
+  red "BLOCKED: secret-bearing filenames staged:"
+  printf '  %s\n' $bad_names
+  fail=1
+fi
+
+# --- 2. secret values in staged content ---
+# Patterns match literal credentials, not variable names like PRIVATE_KEY_SIZE.
+patterns=(
+  'suiprivkey1[a-z0-9]{20,}'                    # Sui private key
+  'BEGIN [A-Z ]*PRIVATE KEY'                    # PEM block
+  'sk-(ant-)?[A-Za-z0-9_-]{20,}'                # OpenAI / Anthropic
+  'AKIA[0-9A-Z]{16}'                            # AWS access key
+  'AIza[0-9A-Za-z_-]{30,}'                      # Google
+  'gh[pousr]_[A-Za-z0-9]{30,}'                  # GitHub token
+  'xox[baprs]-[A-Za-z0-9-]{10,}'                # Slack
+  '(mnemonic|seed_?phrase)["'"'"' ]*[:=]["'"'"' ]*([a-z]+ ){11,}' # 12+ word mnemonic
+)
+
+for p in "${patterns[@]}"; do
+  # -U keeps binary-ish files from silently passing; only added lines are checked.
+  hits=$(git diff --cached -U0 -- $staged | grep -E '^\+' | grep -nEI "$p" || true)
+  if [ -n "$hits" ]; then
+    red "BLOCKED: possible secret matching /$p/ in staged changes:"
+    printf '%s\n' "$hits" | head -5 | sed 's/^/  /'
+    fail=1
+  fi
+done
+
+if [ "$fail" -ne 0 ]; then
+  echo
+  warn "This repo is PUBLIC — a pushed secret is compromised the moment it lands."
+  warn "Unstage the file, move the value into .env / an ignored key file, and recommit."
+  warn "If this is a false positive: git commit --no-verify"
+  exit 1
+fi
+exit 0
