@@ -276,11 +276,31 @@ token in wallet.
    therefore the safe LTV. Read from Chainlink's Robinhood feeds page, do not hardcode.
 2. **Has `adminBurn` ever been used?** Check historical `Transfer`-to-zero events from admin roles.
    Frequency changes whether this is theoretical or operational.
-3. **Who holds `ADMIN_BURNER_ROLE` / `TOKEN_PAUSER_ROLE`?** The registry does not implement
-   `getRoleMemberCount` (AccessControl without the Enumerable extension), so membership cannot be
-   enumerated over RPC — it must be recovered from `RoleGranted` event logs. An EOA and a
-   timelocked multisig are very different risk profiles and this decides how much `adminBurn`
-   should scare us.
+3. ~~Who holds `ADMIN_BURNER_ROLE`?~~ **RESOLVED — and it is the worst of the plausible answers.**
+   Recovered from `RoleGranted` logs on the registry (the contract lacks `AccessControlEnumerable`,
+   so RPC enumeration reverts):
+
+   | Role | Holder | Type |
+   |---|---|---|
+   | `ADMIN_BURNER_ROLE` | `0x957b6de6525c63349f7619743ef1e0ad93cd74d4` | **EOA** |
+   | `TOKEN_PAUSER_ROLE` | `0xfccf56b674113d9c4eb0f9b3370930ced9e6ab23` | **EOA** |
+   | `MINTER_ROLE` | `0x2b94105fff37630f98e1f24811dad588fc5c3a87` | **EOA** |
+   | `MULTIPLIER_UPDATER_ROLE` | `0x92905e8d0e2301ba143215b8d86d63ffd4188143` | **EOA** |
+   | `DEFAULT_ADMIN_ROLE` | `0xd6f8378f8e440c65f8382f5f2728c78dfd55b66d`, `0x074377a78a9710a1d47244f89797718b4f491279` | **EOA** |
+
+   Every privileged role is a plain externally-owned account. No multisig, no timelock, no on-chain
+   governance delay anywhere in the stack. A single key can burn collateral out of a live pool; a
+   single key can freeze every Stock Token; `DEFAULT_ADMIN_ROLE` can grant itself any other role.
+
+   **Honest caveat:** an EOA can still be a hardware-backed or MPC-custodied key with strong
+   operational controls. Chain data can only tell us it is *not a contract* — it cannot show us
+   Robinhood's internal controls. The correct statement is therefore: **there is no on-chain
+   mitigation; the protection is entirely institutional trust in Robinhood.**
+
+   The deny-list is also **actively used** — 246 `Blocked` events on the registry (sampled entries
+   are EOAs, including burn addresses like `0x…dead`), against 4 `Unblocked`. It is live
+   operational machinery, not a dormant capability, so a pool address being blocked is a real
+   scenario to design for rather than a theoretical one.
 4. **Trading MCP jurisdiction coverage** vs Stock Token availability (120+ countries, varies).
 5. **Can a CONTRACT receive a Stock Token?** Source says yes and the deny-list is default-open,
    but this is the one assumption source-reading cannot fully settle — a token could in principle
