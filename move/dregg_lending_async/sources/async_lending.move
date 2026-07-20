@@ -394,9 +394,13 @@ module dregg_lending_async::async_lending {
         assert!(pool.per_collateral_cap == 0 || next <= pool.per_collateral_cap, EOverCollateralCap);
         if (table::contains(&pool.collateral_borrowed, ct)) { *table::borrow_mut(&mut pool.collateral_borrowed, ct) = next; }
         else { table::add(&mut pool.collateral_borrowed, ct, next); };
-        // accumulator: acc_0 = 0 seeds with the first commit; later fold-in
-        pool.batch_root = if (pool.batch_root == 0) { loan_commit }
-            else { sui::poseidon::poseidon_bn254(&vector[pool.batch_root, loan_commit]) };
+        // Accumulator: acc_0 = 0, folded UNCONDITIONALLY (audit F4). The old seed branch
+        // (`if root == 0 { loan_commit }`) had two problems: it made batches [0, c1] and [c1]
+        // accumulate to the same root — a domain-separation ambiguity — and it made a single-loan
+        // batch's root exactly equal to its commit, which is the determinism the cap-reset replay
+        // relied on. It also diverged from batch_accumulator::accumulator::root's documented
+        // acc_0 = 0 convention, so the on-chain root could never equal the circuit's.
+        pool.batch_root = sui::poseidon::poseidon_bn254(&vector[pool.batch_root, loan_commit]);
         pool.total_borrows = pool.total_borrows + debt;
 
         let pos = Position<Collateral, Stable> {
@@ -557,6 +561,18 @@ module dregg_lending_async::async_lending {
         pool.paused = paused;
     }
 
+    /// Split a 32-byte big-endian value into (high 16 bytes, low 16 bytes) as u256, each < 2^128
+    /// < the BN254 scalar field, so both are valid field elements. Mirrors the helper in
+    /// dregg_lending::lending — the two packages are independent, so it cannot be shared.
+    fun split32(b: vector<u8>): (u256, u256) {
+        let mut hi: u256 = 0;
+        let mut lo: u256 = 0;
+        let mut i = 0;
+        while (i < 16) { hi = (hi << 8) | (*vector::borrow(&b, i) as u256); i = i + 1; };
+        while (i < 32) { lo = (lo << 8) | (*vector::borrow(&b, i) as u256); i = i + 1; };
+        (hi, lo)
+    }
+
     /// Has this loan_commit already been disbursed? (indexers + SDK preflight)
     public fun commit_used<Stable>(pool: &Pool<Stable>, loan_commit: u256): bool {
         table::contains(&pool.used_commits, loan_commit)
@@ -661,8 +677,31 @@ module dregg_lending_async::async_lending {
     /// Permissionless batch settle: the batch proof must verify against the on-chain
     /// Poseidon accumulator (reconciliation). On success the batch finalizes, exposure
     /// frees, a fresh batch opens.
-    public fun settle_batch<Stable>(pool: &mut Pool<Stable>, proof: vector<u8>, _ctx: &mut TxContext) {
-        let public_input = sui::bcs::to_bytes(&pool.batch_root);
+    /// SECURITY (audit F4, was HIGH): this was permissionless and its only public input was
+    /// `bcs(batch_root)`. Groth16 verification is stateless — a proof valid for root C is valid
+    /// for C forever — so an attacker could scrape a settle transaction's plaintext proof and then
+    /// alternate `disburse_attested` -> `settle_batch(P)` in one PTB, resetting `total_pending`
+    /// every iteration. `pool.cap`, the only global limit on unproven exposure, was neutralised
+    /// while reading 0 throughout, and `current_batch` advanced over batches never honestly proven.
+    ///
+    /// Two changes close it: the cap gate means only this pool's operator can settle at all, and
+    /// the public input now binds the POOL and the BATCH INDEX, so a proof for batch N at pool A
+    /// is not a proof for batch N+1, nor for pool B.
+    ///
+    /// NOTE: the public input format and the accumulator convention both changed, so the batch
+    /// circuit must be re-proven against `bcs(pool_id) || bcs(current_batch) || bcs(batch_root)`
+    /// with acc_0 = 0. Until then settlement cannot succeed — but nothing in the app calls it,
+    /// and exposure is still released per-loan by repay/liquidate via `release_exposure`.
+    public fun settle_batch<Stable>(cap: &OperatorCap, pool: &mut Pool<Stable>, proof: vector<u8>, _ctx: &mut TxContext) {
+        assert_cap(cap, pool);
+        // Four BN254 scalars, 32 bytes each — groth16 requires len % 32 == 0, and a raw 32-byte
+        // object ID can exceed the field modulus, so the pool ID is split into two <2^128 limbs
+        // (the same convention as dregg_lending::lending::loan_commit_of).
+        let (pool_hi, pool_lo) = split32(object::id_to_bytes(&object::id(pool)));
+        let mut public_input = sui::bcs::to_bytes(&pool_hi);
+        vector::append(&mut public_input, sui::bcs::to_bytes(&pool_lo));
+        vector::append(&mut public_input, sui::bcs::to_bytes(&(pool.current_batch as u256)));
+        vector::append(&mut public_input, sui::bcs::to_bytes(&pool.batch_root));
         assert!(verifier::verify(pool.vk, public_input, proof), EBadProof);
         pool.last_settled = pool.current_batch;
         pool.current_batch = pool.current_batch + 1;
@@ -675,6 +714,8 @@ module dregg_lending_async::async_lending {
     public fun pool_borrows<Stable>(p: &Pool<Stable>): u64 { p.total_borrows }
     public fun pool_reserves<Stable>(p: &Pool<Stable>): u64 { p.total_reserves }
     public fun per_collateral_cap<Stable>(p: &Pool<Stable>): u64 { p.per_collateral_cap }
+    public fun batch_root_of<Stable>(p: &Pool<Stable>): u256 { p.batch_root }
+    public fun current_batch_of<Stable>(p: &Pool<Stable>): u64 { p.current_batch }
     public fun collateral_borrowed_of<Collateral, Stable>(p: &Pool<Stable>): u64 {
         let ct = type_name::get<Collateral>();
         if (table::contains(&p.collateral_borrowed, ct)) { *table::borrow(&p.collateral_borrowed, ct) } else { 0 }

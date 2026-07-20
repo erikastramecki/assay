@@ -164,7 +164,7 @@ module dregg_lending_async::async_lending_tests {
             &cap, &mut pool, coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx),
             500_000_000, @0xB0B, 42u256, &clk, &mut ctx);
         // a proof that does not reconcile with the accumulator must abort
-        al::settle_batch<USDC>(&mut pool, bad_proof(), &mut ctx);
+        al::settle_batch<USDC>(&cap, &mut pool, bad_proof(), &mut ctx);
 
         // unreachable
         coin::burn_for_testing(loan);
@@ -330,6 +330,38 @@ module dregg_lending_async::async_lending_tests {
         let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
         al::set_operator_pubkey(&cap, &mut pool, x"0202", &mut ctx); // truncated paste
         // unreachable
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    /// F4 REGRESSION — settle_batch was permissionless, so anyone could scrape a proof from a
+    /// settle transaction and replay it to reset `total_pending`, neutralising the only global
+    /// cap on unproven exposure. A foreign cap must now be refused.
+    #[test]
+    #[expected_failure(abort_code = al::EWrongPool)]
+    fun settle_batch_rejects_a_foreign_cap() {
+        let mut ctx = tx_context::dummy();
+        let (mut victim, victim_cap, clk) = attest_fixture(0, &mut ctx);
+        let (attacker_pool, attacker_cap) = al::new_pool<USDC>(0, 0, 0, 8000, 0, 1, 0, vk(), opk(), &clk, &mut ctx);
+        al::settle_batch<USDC>(&attacker_cap, &mut victim, bad_proof(), &mut ctx);
+        // unreachable
+        clock::destroy_for_testing(clk);
+        test_utils::destroy(victim); test_utils::destroy(victim_cap);
+        test_utils::destroy(attacker_pool); test_utils::destroy(attacker_cap);
+    }
+
+    /// The accumulator must fold from acc_0 = 0 unconditionally. The old seed branch made a
+    /// single-loan batch's root equal its commit — the determinism the replay relied on — and made
+    /// batches [0, c1] and [c1] indistinguishable.
+    #[test]
+    fun batch_root_folds_from_zero_and_is_not_the_bare_commit() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        let commit = 12345u256;
+        let (loan, pos) = al::disburse<SSPX, USDC>(&cap, &mut pool,
+            coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx), 100_000_000, ctx.sender(), commit, &clk, &mut ctx);
+        assert!(al::batch_root_of(&pool) != commit, 0);          // not the bare commit
+        assert!(al::batch_root_of(&pool) != 0, 1);               // and actually folded
+        coin::burn_for_testing(loan); test_utils::destroy(pos);
         clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
     }
 

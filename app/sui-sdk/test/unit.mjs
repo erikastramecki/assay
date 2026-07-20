@@ -91,7 +91,7 @@ await t("deposit + withdraw + disburse + repay + settle build cleanly", () => {
   ptb.disburseAttested(tx, { pkg: PKG, collType: `${PKG}::sspx::SSPX`, stableType: `${PKG}::tusdc::TUSDC`, pool: "0x2", collateralCoin: c2, debt: 500n, loanCommit: 999n, expiryS: 1_700_000_060n, attestation: new Uint8Array(64) });
   const [c3] = tx.splitCoins(tx.gas, [500n]);
   ptb.repay(tx, { pkg: PKG, collType: `${PKG}::sspx::SSPX`, stableType: `${PKG}::tusdc::TUSDC`, pool: "0x2", position: "0x3", paymentCoin: c3, recipient: BORROWER });
-  ptb.settleBatch(tx, { pkg: PKG, stableType: `${PKG}::tusdc::TUSDC`, pool: "0x2", proof: new Uint8Array(128) });
+  ptb.settleBatch(tx, { pkg: PKG, stableType: `${PKG}::tusdc::TUSDC`, cap: "0x3", pool: "0x2", proof: new Uint8Array(128) });
   const data = tx.getData();
   const calls = data.commands.filter((c) => c.MoveCall).map((c) => c.MoveCall.function);
   for (const fn of ["deposit", "withdraw", "disburse_attested", "repay", "settle_batch"])

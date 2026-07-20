@@ -115,11 +115,12 @@ export function liquidate(
 
 export function settleBatch(
   tx: Transaction,
-  o: { pkg: string; stableType: string; pool: string; proof: Uint8Array },
+  /** `cap` is the pool's OperatorCap — settle is no longer permissionless (audit F4). */
+  o: { pkg: string; stableType: string; cap: string; pool: string; proof: Uint8Array },
 ) {
   tx.moveCall({
     target: target(o.pkg, "settle_batch"),
     typeArguments: [o.stableType],
-    arguments: [tx.object(o.pool), tx.pure.vector("u8", Array.from(o.proof))],
+    arguments: [tx.object(o.cap), tx.object(o.pool), tx.pure.vector("u8", Array.from(o.proof))],
   });
 }
