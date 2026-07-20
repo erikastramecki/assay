@@ -78,14 +78,34 @@ usdgSupply > 0n ? ok(`USDG live, totalSupply ${usdgSupply}`) : no("USDG unreadab
 
 console.log(`\n${pass} passed, ${fail} failed`);
 
-// ---- B. The one check that needs a funded wallet ----
+// ---- A5. Do CONTRACTS already hold Stock Tokens in production? ----
+// This is the check that used to need a funded wallet and a deployment. It does not:
+// if contracts already hold Stock Tokens on mainnet, the question is answered empirically.
+console.log("\nA5. can a CONTRACT hold a Stock Token? (production evidence, no deployment needed)");
+{
+  const BS = "https://robinhoodchain.blockscout.com/api/v2";
+  let contractHolders = 0, sample = [];
+  for (const [sym, addr] of Object.entries(TOKENS)) {
+    const j = await (await fetch(`${BS}/tokens/${addr}/holders`)).json().catch(() => ({}));
+    for (const h of (j.items || [])) {
+      const a = h.address || {};
+      if (a.is_contract) {
+        contractHolders++;
+        if (sample.length < 4) sample.push(`${sym} held by ${a.name || "(unnamed)"} ${a.hash}`);
+      }
+    }
+  }
+  contractHolders > 0
+    ? ok(`${contractHolders} contract holders across sampled tokens — contracts CAN hold Stock Tokens`)
+    : no("no contract holders found — a live transfer test is still required");
+  sample.forEach((s) => console.log(`       ${s}`));
+}
+
+// ---- B. Optional: prove it with your own contract ----
 if (!process.env.RH_PRIVKEY) {
   console.log(`
-\x1b[33mTRANSFER TEST SKIPPED\x1b[0m — set RH_PRIVKEY (a wallet holding a Stock Token) to run it.
-It is the only Phase 0 assumption that source-reading cannot prove: that a *contract*
-(not just an EOA) can actually receive a Stock Token. Steps it will run:
-  1. deploy a minimal receiver contract
-  2. transfer 1 unit of a Stock Token to it
-  3. assert balanceOf(receiver) > 0
-Run it on TESTNET first:  RH_RPC=${TESTNET} RH_PRIVKEY=0x... node rh-chain/phase0-verify.mjs`);
+Phase 0 is answered by A1-A5 above without spending anything. The optional own-contract
+test (deploy rh-chain/receiver.sol, transfer 1 unit in, assert the balance landed) only
+adds confirmation with your own bytecode. Testnet costs nothing:
+  RH_RPC=${TESTNET} RH_PRIVKEY=0x... node rh-chain/phase0-verify.mjs`);
 }

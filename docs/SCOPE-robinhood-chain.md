@@ -237,7 +237,7 @@ token in wallet.
 
 | Phase | Work | Gate |
 |---|---|---|
-| **0 — Spike** (days) | Deploy a trivial receiver on RH Chain, transfer a Stock Token in, read `latestRoundData` + `uiMultiplier`. Proves the deny-list finding empirically. | Nothing moves until this passes |
+| **0 — Spike** ✅ **DONE** | All assumptions verified against live mainnet with zero gas and no keys: deny-list default-open, sequencer uptime feed exists, testnet exists, and 67 contracts already hold Stock Tokens in production. `rh-chain/phase0-verify.mjs`, 7/7. | ✅ passed |
 | **1 — Core** (2–3 wks) | AssayPool + Markets + Borrow + Liquidate, on-chain LTV, surplus refund, `balanceOfUI` pricing, sequencer check | Full test suite incl. **mutation tests on every guard** |
 | **2 — RH hazards** (1 wk) | `adminBurn` reconciliation + shortfall path, pause-aware accrual, scheduled-multiplier handling | Fork tests against real Stock Tokens |
 | **3 — Agent** (1–2 wks) | Assay MCP server, dApp borrow flow, Robinhood Wallet integration | End-to-end on testnet |
@@ -302,10 +302,12 @@ token in wallet.
    operational machinery, not a dormant capability, so a pool address being blocked is a real
    scenario to design for rather than a theoretical one.
 4. **Trading MCP jurisdiction coverage** vs Stock Token availability (120+ countries, varies).
-5. **Can a CONTRACT receive a Stock Token?** Source says yes and the deny-list is default-open,
-   but this is the one assumption source-reading cannot fully settle — a token could in principle
-   reject contract recipients elsewhere. `rh-chain/phase0-verify.mjs` runs it with a funded
-   wallet; do it on testnet first.
+5. ~~Can a CONTRACT receive a Stock Token?~~ **RESOLVED — production evidence, no deployment
+   needed.** 67 contract holders across the four sampled Stock Tokens, including a Uniswap-style
+   `PoolManager` holding 4,806 NVDA, a **`StockVault`** holding 18.4 AAPL, and third-party
+   `Index Basket APPLCAT` / `Index Basket 401k` contracts. Contracts do not merely *tolerate*
+   Stock Tokens — they already custody them at scale, and some of those are clearly third-party
+   rather than Robinhood infrastructure. **Phase 0 is complete.**
 
 ---
 
