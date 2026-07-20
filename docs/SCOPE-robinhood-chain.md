@@ -248,17 +248,44 @@ token in wallet.
 
 ## 6. Open questions
 
-1. **Sequencer uptime feed** — does Chainlink publish one for Robinhood Chain? Without it, an L2
-   outage means stale prices are trusted. Blocks Phase 1 liquidation safety.
-2. **Feed heartbeats and deviation thresholds** per Stock Token — sets the staleness bound and
-   therefore the safe LTV.
-3. **Off-hours behaviour** — do equity feeds update when US markets are closed, or go stale
-   nightly? Determines whether 24/7 borrowing is safe or needs a wider haircut off-hours.
-4. **Has `adminBurn` ever been used?** Check historical `Transfer`-to-zero events from admin roles.
+**RESOLVED in Phase 0 (2026-07-20)** — verified against live mainnet, chainId 4663:
+
+- ✅ **Deny-list confirmed empirically.** `isBlocked()` returns false for a never-used address, the
+  zero address, vitalik.eth and a plain mainnet contract address. Default-open. Registry is
+  `0xe10b6f6b275de231345c20d14ab812db62151b00`. Run `node rh-chain/phase0-verify.mjs` to re-check.
+- ✅ **Sequencer uptime feed EXISTS.** Chainlink publishes an L2 Sequencer Uptime Feed for
+  Robinhood Chain: *"check it before reading any price."* Liquidation safety is achievable.
+- ✅ **There is a TESTNET** (chainId 46630, `https://rpc.testnet.chain.robinhood.com/rpc`), so
+  Phases 0–3 need no real money.
+- ✅ Registry and all four sampled Stock Tokens are currently unpaused; `uiMultiplier` is 1.0
+  across AAPL/TSLA/NVDA/SPY (no corporate action applied yet — so a split has never yet exercised
+  that code path in production).
+- ⚠️ **Stock feeds update 24/5, following market hours — they go STALE nights and weekends.**
+  This is the significant one and it changes risk design. Robinhood Chain markets Stock Tokens as
+  24/7 tradeable, but the *price* is not 24/7. Borrowing against a Friday-close price through a
+  weekend gap is the classic RWA blowup: the stock gaps on Monday open and no liquidation was
+  possible in between. Required response, decided deliberately rather than by default:
+  a materially lower LTV while the feed is stale, and/or blocking new borrows off-hours, and
+  liquidation eligibility evaluated on unpaused, fresh-feed time. The Sui operator already
+  encoded this instinct (`maxStaleOffHoursSecs`, market-hours awareness in `operator/pyth.mjs`) —
+  on this chain it becomes an on-chain concern.
+
+**Still open:**
+
+1. **Feed heartbeats and deviation thresholds** per Stock Token — sets the staleness bound and
+   therefore the safe LTV. Read from Chainlink's Robinhood feeds page, do not hardcode.
+2. **Has `adminBurn` ever been used?** Check historical `Transfer`-to-zero events from admin roles.
    Frequency changes whether this is theoretical or operational.
-5. **Who holds `ADMIN_BURNER_ROLE` / `TOKEN_PAUSER_ROLE`?** Read the registry. An EOA and a
-   timelocked multisig are very different risk profiles.
-6. **Trading MCP jurisdiction coverage** vs Stock Token availability (120+ countries, varies).
+3. **Who holds `ADMIN_BURNER_ROLE` / `TOKEN_PAUSER_ROLE`?** The registry does not implement
+   `getRoleMemberCount` (AccessControl without the Enumerable extension), so membership cannot be
+   enumerated over RPC — it must be recovered from `RoleGranted` event logs. An EOA and a
+   timelocked multisig are very different risk profiles and this decides how much `adminBurn`
+   should scare us.
+4. **Trading MCP jurisdiction coverage** vs Stock Token availability (120+ countries, varies).
+5. **Can a CONTRACT receive a Stock Token?** Source says yes and the deny-list is default-open,
+   but this is the one assumption source-reading cannot fully settle — a token could in principle
+   reject contract recipients elsewhere. `rh-chain/phase0-verify.mjs` runs it with a funded
+   wallet; do it on testnet first.
 
 ---
 
