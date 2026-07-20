@@ -38,6 +38,7 @@ REG=$(cat /tmp/dev-reg.json); FAU=$(cat /tmp/dev-fau.json)
 MPKG=$(python3 -c "import json;print(json.load(open('$HERE/markets.json'))['marketsPkg'])")
 pkill -f server-sui.mjs 2>/dev/null; sleep 1
 ( cd "$ROOT/operator-api" && COLLATERAL_REGISTRY="$REG" FAUCET_MINTS="$FAU" PORT=8788 SUI_NETWORK=devnet \
+  POOL_ID="$POOL" STABLE_TYPE="$TUSDC_TYPE" \
   node --import tsx server-sui.mjs >/tmp/op-sui.log 2>&1 & )
 for i in $(seq 1 20); do curl -s http://127.0.0.1:8788/health >/dev/null 2>&1 && break; sleep 1; done
 echo "operator API: $(curl -s http://127.0.0.1:8788/health)"

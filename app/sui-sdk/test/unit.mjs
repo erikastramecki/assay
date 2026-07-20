@@ -14,46 +14,62 @@ const BORROWER = "0x8f15b73cc91905a7eda7500e5142b990084ae5acfba4158b90566bddd5a7
 const PKG = "0xcb94061032948acf586f2f0930d2941ccd71b2ffcf4b16fa99592cddf65cfc4b";
 
 const COLL = `${PKG}::tbtc::TBTC`, COLL2 = `${PKG}::tfake::TFAKE`;
+const STABLE = `${PKG}::tusdc::TUSDC`, STABLE2 = `${PKG}::other::OTHER`;
+const POOL = "0x00000000000000000000000000000000000000000000000000000000000000aa";
+const POOL2 = "0x00000000000000000000000000000000000000000000000000000000000000bb";
+
+/** Baseline terms; spread-and-override to vary exactly one field per assertion. */
+const TERMS = {
+  poolId: POOL, borrower: BORROWER, debt: 500_000_000n, collateralAmount: 10_000_000_000n,
+  loanCommit: 999n, expiryS: 1_700_000_060n, collateralType: COLL, stableType: STABLE,
+};
 
 console.log("attestation:");
-await t("message binds addr+debt+coll+commit+TYPE with correct offsets", () => {
-  const m = attestationMessage(BORROWER, 500_000_000n, 10_000_000_000n, 999n, COLL);
-  assert.ok(m.length > 80, "80 fixed + the collateral type name");
-  const debt = new DataView(m.buffer, 32, 8).getBigUint64(0, true);
-  assert.equal(debt, 500_000_000n);
-  const coll = new DataView(m.buffer, 40, 8).getBigUint64(0, true);
-  assert.equal(coll, 10_000_000_000n);
+await t("message binds addr+debt+coll+commit+expiry+pool+TYPEs at correct offsets", () => {
+  const m = attestationMessage(TERMS);
+  assert.ok(m.length > 120, "120 fixed bytes + two length-prefixed type names");
+  const at = (off) => new DataView(m.buffer, m.byteOffset + off, 8).getBigUint64(0, true);
+  assert.equal(at(32), 500_000_000n);    // debt
+  assert.equal(at(40), 10_000_000_000n); // collateral amount
+  assert.equal(at(80), 1_700_000_060n);  // expiry (after the 32-byte loan_commit)
 });
 
 await t("sign → verify roundtrip succeeds", async () => {
   const op = new Ed25519Keypair();
-  const sig = await signAttestation(op, BORROWER, 500_000_000n, 10_000_000_000n, 999n, COLL);
+  const sig = await signAttestation(op, TERMS);
   assert.equal(sig.length, 64);
   assert.equal(operatorPubkeyBytes(op).length, 32);
-  assert.equal(await verifyAttestation(operatorPubkeyBytes(op), sig, BORROWER, 500_000_000n, 10_000_000_000n, 999n, COLL), true);
+  assert.equal(await verifyAttestation(operatorPubkeyBytes(op), sig, TERMS), true);
 });
 
 await t("tampering ANY term breaks verification", async () => {
   const op = new Ed25519Keypair();
-  const sig = await signAttestation(op, BORROWER, 500_000_000n, 10_000_000_000n, 999n, COLL);
+  const sig = await signAttestation(op, TERMS);
   const pk = operatorPubkeyBytes(op);
-  assert.equal(await verifyAttestation(pk, sig, BORROWER, 999_000_000n, 10_000_000_000n, 999n, COLL), false); // debt
-  assert.equal(await verifyAttestation(pk, sig, BORROWER, 500_000_000n, 1n, 999n, COLL), false); // coll amount
-  assert.equal(await verifyAttestation(pk, sig, "0x1", 500_000_000n, 10_000_000_000n, 999n, COLL), false); // borrower
-  assert.equal(await verifyAttestation(pk, sig, BORROWER, 500_000_000n, 10_000_000_000n, 1n, COLL), false); // commit
+  const breaks = async (over, label) =>
+    assert.equal(await verifyAttestation(pk, sig, { ...TERMS, ...over }), false, label);
+  await breaks({ debt: 999_000_000n }, "debt");
+  await breaks({ collateralAmount: 1n }, "collateral amount");
+  await breaks({ borrower: "0x1" }, "borrower");
+  await breaks({ loanCommit: 1n }, "commit");
+  await breaks({ expiryS: 1_700_009_999n }, "expiry");        // audit F2.1
+  await breaks({ poolId: POOL2 }, "pool");                    // audit F2.3
+  await breaks({ collateralType: COLL2 }, "collateral type"); // collateral substitution
+  await breaks({ stableType: STABLE2 }, "stable type");       // audit F2.3
 });
 
-await t("collateral-substitution is blocked (audit fix): same terms, different TYPE → no verify", async () => {
-  const op = new Ed25519Keypair();
-  const sig = await signAttestation(op, BORROWER, 500_000_000n, 10_000_000_000n, 999n, COLL);
-  // an attacker presenting a worthless coin type of the same unit-count must NOT pass
-  assert.equal(await verifyAttestation(operatorPubkeyBytes(op), sig, BORROWER, 500_000_000n, 10_000_000_000n, 999n, COLL2), false);
+await t("type names are length-prefixed, so no (collateral,stable) split is ambiguous", async () => {
+  // Raw concatenation would make ("ab","c") and ("a","bc") identical bytes, letting one signature
+  // authorize a different type pair. Length prefixes must make these two messages differ.
+  const a = attestationMessage({ ...TERMS, collateralType: `${PKG}::ab::AB`, stableType: `${PKG}::c::C` });
+  const b = attestationMessage({ ...TERMS, collateralType: `${PKG}::a::A`, stableType: `${PKG}::bc::BC` });
+  assert.notDeepEqual(Array.from(a), Array.from(b));
 });
 
 await t("a different operator's signature does not verify", async () => {
   const op1 = new Ed25519Keypair(), op2 = new Ed25519Keypair();
-  const sig = await signAttestation(op1, BORROWER, 500_000_000n, 10_000_000_000n, 999n, COLL);
-  assert.equal(await verifyAttestation(operatorPubkeyBytes(op2), sig, BORROWER, 500_000_000n, 10_000_000_000n, 999n, COLL), false);
+  const sig = await signAttestation(op1, TERMS);
+  assert.equal(await verifyAttestation(operatorPubkeyBytes(op2), sig, TERMS), false);
 });
 
 console.log("math:");
@@ -72,7 +88,7 @@ await t("deposit + withdraw + disburse + repay + settle build cleanly", () => {
   ptb.deposit(tx, { pkg: PKG, stableType: `${PKG}::tusdc::TUSDC`, pool: "0x2", coin: c1 });
   ptb.withdraw(tx, { pkg: PKG, stableType: `${PKG}::tusdc::TUSDC`, pool: "0x2", shares: 100n, recipient: BORROWER });
   const [c2] = tx.splitCoins(tx.gas, [500n]);
-  ptb.disburseAttested(tx, { pkg: PKG, collType: `${PKG}::sspx::SSPX`, stableType: `${PKG}::tusdc::TUSDC`, pool: "0x2", collateralCoin: c2, debt: 500n, loanCommit: 999n, attestation: new Uint8Array(64) });
+  ptb.disburseAttested(tx, { pkg: PKG, collType: `${PKG}::sspx::SSPX`, stableType: `${PKG}::tusdc::TUSDC`, pool: "0x2", collateralCoin: c2, debt: 500n, loanCommit: 999n, expiryS: 1_700_000_060n, attestation: new Uint8Array(64) });
   const [c3] = tx.splitCoins(tx.gas, [500n]);
   ptb.repay(tx, { pkg: PKG, collType: `${PKG}::sspx::SSPX`, stableType: `${PKG}::tusdc::TUSDC`, pool: "0x2", position: "0x3", paymentCoin: c3, recipient: BORROWER });
   ptb.settleBatch(tx, { pkg: PKG, stableType: `${PKG}::tusdc::TUSDC`, pool: "0x2", proof: new Uint8Array(128) });

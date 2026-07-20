@@ -8,9 +8,18 @@ HERE="$(cd "$(dirname "$0")" && pwd)"; ROOT="$(cd "$HERE/.." && pwd)"
 OPDIR="$ROOT/operator-api"; OPVDIR="$OPDIR/assay-operator"; WEBDIR="$ROOT/web"
 
 echo "── operator: env + redeploy ──"
+# POOL_ID + STABLE_TYPE come from the WEB build config, so the operator and the app can never
+# disagree about which pool they're on. Attestations bind the pool id (audit F2.3): a mismatch
+# makes every signature fail ed25519_verify on-chain, and the operator refuses to boot without them.
+POOL_ID=$(grep -E '^VITE_POOL=' "$WEBDIR/.env.production" | cut -d= -f2-)
+STABLE_TYPE=$(grep -E '^VITE_STABLE_TYPE=' "$WEBDIR/.env.production" | cut -d= -f2-)
+[ -z "$POOL_ID" ] || [ -z "$STABLE_TYPE" ] && { echo "VITE_POOL / VITE_STABLE_TYPE missing from $WEBDIR/.env.production"; exit 1; }
+
 ( cd "$OPVDIR"
   vercel env rm COLLATERAL_REGISTRY production --yes >/dev/null 2>&1; vercel env add COLLATERAL_REGISTRY production --force < "$HERE/registry.json" >/dev/null 2>&1
-  vercel env rm FAUCET_MINTS production --yes >/dev/null 2>&1;        vercel env add FAUCET_MINTS production --force < "$HERE/faucet.json" >/dev/null 2>&1 )
+  vercel env rm FAUCET_MINTS production --yes >/dev/null 2>&1;        vercel env add FAUCET_MINTS production --force < "$HERE/faucet.json" >/dev/null 2>&1
+  vercel env rm POOL_ID production --yes >/dev/null 2>&1;             printf '%s' "$POOL_ID"     | vercel env add POOL_ID production --force >/dev/null 2>&1
+  vercel env rm STABLE_TYPE production --yes >/dev/null 2>&1;         printf '%s' "$STABLE_TYPE" | vercel env add STABLE_TYPE production --force >/dev/null 2>&1 )
 # re-bundle (picks up any server code changes) + deploy
 ( cd "$OPDIR" && ./node_modules/.bin/esbuild server-sui.mjs --bundle --platform=node --format=esm --target=node20 \
     --outfile=assay-operator/api/index.mjs --log-level=warning \

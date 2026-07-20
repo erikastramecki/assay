@@ -55,7 +55,7 @@ for (let i = 0; i < PLAN.length; i++) {
   // borrow: on-chain disburse_attested with the hosted (type-bound) attestation
   let borrowTx, posId;
   { const tx = new Transaction(); const coll = await exactCoin(tx, client, me, type, BigInt(b.collateralBase));
-    ptb.disburseAttested(tx, { pkg: LENDING, collType: type, stableType: TUSDC, pool: POOL, collateralCoin: coll, debt: BigInt(b.debtBase), loanCommit: BigInt(b.loanCommit), attestation: fromHex(b.attestation) });
+    ptb.disburseAttested(tx, { pkg: LENDING, collType: type, stableType: TUSDC, pool: POOL, collateralCoin: coll, debt: BigInt(b.debtBase), loanCommit: BigInt(b.loanCommit), expiryS: BigInt(b.expiryS), attestation: fromHex(b.attestation) });
     const r = await exec(tx); borrowTx = r.digest; posId = created(r, "async_lending::Position"); }
   // repay: rate=0 → owed == principal == debtBase, exact + deterministic
   let repayTx;

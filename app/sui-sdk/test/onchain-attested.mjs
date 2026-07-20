@@ -56,10 +56,15 @@ let pool;
 
 // 4. disburse_attested — operator (me) signs the exact terms; contract verifies ed25519 in-Move
 const debt = 500_000_000n, collAmt = 10_000_000_000n, commit = 999n;
-const attestation = await signAttestation(kp, me, debt, collAmt, commit, SSPX);
+// the attestation binds pool + stable type + a short expiry (audit F2)
+const expiryS = BigInt(Math.floor(Date.now() / 1000)) + 90n;
+const attestation = await signAttestation(kp, {
+  poolId: pool, borrower: me, debt, collateralAmount: collAmt, loanCommit: commit,
+  expiryS, collateralType: SSPX, stableType: TUSDC,
+});
 let position;
 { const tx = new Transaction(); const coll = await exactCoin(tx, client, me, SSPX, collAmt);
-  ptb.disburseAttested(tx, { pkg: LENDING, collType: SSPX, stableType: TUSDC, pool, collateralCoin: coll, debt, loanCommit: commit, attestation });
+  ptb.disburseAttested(tx, { pkg: LENDING, collType: SSPX, stableType: TUSDC, pool, collateralCoin: coll, debt, loanCommit: commit, expiryS, attestation });
   const r = await exec(tx, "disburse_attested (non-custodial borrow)");
   position = created(r, "async_lending::Position");
   console.log("   position:", position); }

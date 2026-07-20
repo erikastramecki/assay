@@ -8,7 +8,7 @@ import { Transaction } from "@mysten/sui/transactions";
 import { fromHex } from "@mysten/sui/utils";
 import { readFileSync } from "node:fs";
 import os from "node:os";
-import { ptb, exactCoin, findPositions } from "../sui-sdk/src/index.ts";
+import { ptb, exactCoin, findPositions, operatorPubkeyBytes } from "../sui-sdk/src/index.ts";
 
 const API = process.env.API_URL || "http://127.0.0.1:8788";
 const LENDING = process.env.LENDING, COINS = process.env.COINS;
@@ -32,18 +32,30 @@ async function exec(tx, label) {
 }
 const created = (r, needle) => r.objectChanges.find((c) => c.type === "created" && c.objectType.includes(needle))?.objectId;
 
-// operator pubkey comes from the running API — the pool must pin exactly this key
+// TWO PHASES. The attestation now binds the pool id (audit F2.3), so the operator must know its
+// pool at boot — but the pool must pin the operator's pubkey. The cycle is broken by deriving the
+// pubkey from the operator's keyfile here, creating the pool FIRST, then booting the operator
+// with POOL_ID. Phase is selected by argv: `init` (mint+pool+deposit) then `borrow`.
+const PHASE = process.argv[2] || "borrow";
+
+if (PHASE === "init") {
+  const opKeyfile = process.env.OPERATOR_KEY || new URL(".operator-sui.key", import.meta.url).pathname;
+  const opPubkey = operatorPubkeyBytes(Ed25519Keypair.fromSecretKey(readFileSync(opKeyfile, "utf8").trim()));
+  { const tx = new Transaction(); tx.moveCall({ target: `${COINS}::tusdc::mint`, arguments: [tx.object(CAP_USDC), tx.pure.u64(1_000_000_000n), tx.pure.address(me)] }); await exec(tx, "mint 1000 TUSDC"); }
+  { const tx = new Transaction(); tx.moveCall({ target: `${COINS}::sspx::mint`, arguments: [tx.object(CAP_SSPX), tx.pure.u64(10_000_000_000n), tx.pure.address(me)] }); await exec(tx, "mint 100 SSPX"); }
+  let pool;
+  { const tx = new Transaction();
+    ptb.initPool(tx, { pkg: LENDING, stableType: TUSDC, curve: { baseBps: 0, slope1Bps: 0, slope2Bps: 0, kinkBps: 8000, reserveBps: 0 }, cap: 1_000_000_000_000n, perCollateralCap: 0n, vk: VK, operatorPubkey: opPubkey });
+    const r = await exec(tx, "init_pool (operator = keyfile key)"); pool = created(r, "async_lending::Pool"); }
+  { const tx = new Transaction(); const coin = await exactCoin(tx, client, me, TUSDC, 1_000_000_000n); ptb.deposit(tx, { pkg: LENDING, stableType: TUSDC, pool, coin }); await exec(tx, "deposit 1000"); }
+  console.log("POOL=" + pool); // consumed by test-borrow-sui.sh
+  process.exit(0);
+}
+
+const pool = process.env.POOL;
+if (!pool) { console.error("POOL must be set (run the `init` phase first)"); process.exit(1); }
 const health = await (await fetch(API + "/health")).json();
 console.log("operator pubkey (from API):", health.operatorPubkey);
-
-{ const tx = new Transaction(); tx.moveCall({ target: `${COINS}::tusdc::mint`, arguments: [tx.object(CAP_USDC), tx.pure.u64(1_000_000_000n), tx.pure.address(me)] }); await exec(tx, "mint 1000 TUSDC"); }
-{ const tx = new Transaction(); tx.moveCall({ target: `${COINS}::sspx::mint`, arguments: [tx.object(CAP_SSPX), tx.pure.u64(10_000_000_000n), tx.pure.address(me)] }); await exec(tx, "mint 100 SSPX"); }
-
-let pool;
-{ const tx = new Transaction();
-  ptb.initPool(tx, { pkg: LENDING, stableType: TUSDC, curve: { baseBps: 0, slope1Bps: 0, slope2Bps: 0, kinkBps: 8000, reserveBps: 0 }, cap: 1_000_000_000_000n, perCollateralCap: 0n, vk: VK, operatorPubkey: fromHex(health.operatorPubkey) });
-  const r = await exec(tx, "init_pool (operator = API key)"); pool = created(r, "async_lending::Pool"); }
-{ const tx = new Transaction(); const coin = await exactCoin(tx, client, me, TUSDC, 1_000_000_000n); ptb.deposit(tx, { pkg: LENDING, stableType: TUSDC, pool, coin }); await exec(tx, "deposit 1000"); }
 
 const q = await post("/quote", { collateralMint: SSPX, collateralWhole: 100 });
 console.log(`quote: price $${(q.priceCents / 100).toFixed(2)}  maxBorrow $${q.maxBorrowUsdc}  (mktHours=${q.marketHours})`);
@@ -52,7 +64,7 @@ const b = await post("/borrow", { borrower: me, collateralMint: SSPX, collateral
 console.log(`/borrow → dregg ${b.authorized.includes("AUTHORIZED") ? "AUTHORIZED" : b.authorized}; attestation ${b.attestation.slice(0, 20)}…`);
 
 { const tx = new Transaction(); const coll = await exactCoin(tx, client, me, SSPX, BigInt(b.collateralBase));
-  ptb.disburseAttested(tx, { pkg: LENDING, collType: SSPX, stableType: TUSDC, pool, collateralCoin: coll, debt: BigInt(b.debtBase), loanCommit: BigInt(b.loanCommit), attestation: fromHex(b.attestation) });
+  ptb.disburseAttested(tx, { pkg: LENDING, collType: SSPX, stableType: TUSDC, pool, collateralCoin: coll, debt: BigInt(b.debtBase), loanCommit: BigInt(b.loanCommit), expiryS: BigInt(b.expiryS), attestation: fromHex(b.attestation) });
   await exec(tx, "disburse_attested (with API attestation)"); }
 
 const pos = await findPositions(client, LENDING, me);

@@ -20,7 +20,7 @@ await new Promise((r) => setTimeout(r, 2500));
 const b = await post("/borrow", { borrower: me, collateralMint: BTC, collateralAmount: 100_000_000, debtUsdc: 4000 });
 const tx = new Transaction();
 const coll = await exactCoin(tx, client, me, BTC, BigInt(b.collateralBase));
-ptb.disburseAttested(tx, { pkg: LENDING, collType: BTC, stableType: STABLE, pool: POOL, collateralCoin: coll, debt: BigInt(b.debtBase), loanCommit: BigInt(b.loanCommit), attestation: fromHex(b.attestation) });
+ptb.disburseAttested(tx, { pkg: LENDING, collType: BTC, stableType: STABLE, pool: POOL, collateralCoin: coll, debt: BigInt(b.debtBase), loanCommit: BigInt(b.loanCommit), expiryS: BigInt(b.expiryS), attestation: fromHex(b.attestation) });
 await exec(tx, "borrow 4000 USDC vs 1 BTC");
 const p = await readPool(client, POOL);
 console.log(`\nLIVE pool now: utilization ${(utilization(p) * 100).toFixed(1)}% | borrow APR ${(borrowRateBps(p) / 100).toFixed(2)}% | supply APY ${supplyApyPct(p).toFixed(2)}%`);

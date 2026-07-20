@@ -41,13 +41,31 @@ const mintTargetFor = (coinType) => coinType.split("::").slice(0, 2).join("::") 
 const suiClient = new SuiClient({ url: process.env.SUI_RPC || getFullnodeUrl(NETWORK) });
 const faucetSeen = new Map(); // address → last mint ms (rate limit)
 
+// AUDIT F2.3 — the attestation binds the pool it may be spent at and the asset it draws, so a
+// signature issued for this pool cannot be replayed against another pool pinning the same
+// operator key. These MUST match the deployed pool; a mismatch makes every signature fail verify.
+// Fail at boot, not at borrow time: with these unset every attestation would bind the wrong pool
+// and fail ed25519_verify on-chain, which reads as a key problem rather than a config problem.
+const POOL_ID = process.env.POOL_ID || "";
+const STABLE_TYPE = process.env.STABLE_TYPE || "";
+if (!/^0x[0-9a-fA-F]{1,64}$/.test(POOL_ID)) throw new Error("POOL_ID must be set to the pool this operator attests for (audit F2.3)");
+if (!/^0x[0-9a-fA-F]{1,64}::[^:]+::.+$/.test(STABLE_TYPE)) throw new Error("STABLE_TYPE must be set to the pool's stable coin type (audit F2.3)");
+// AUDIT F2.1 — attestation lifetime in seconds. Must stay <= MAX_ATTEST_WINDOW_S (120) in
+// async_lending.move, and wants headroom for the borrower to sign in their wallet.
+const ATTEST_TTL_S = Number(process.env.ATTEST_TTL_S || 90);
+if (ATTEST_TTL_S > 120) throw new Error("ATTEST_TTL_S exceeds the contract's MAX_ATTEST_WINDOW_S (120)");
+
 // Server owns the risk params (audit CRITICAL-2). On Sui a "collateral mint" is a Coin TYPE.
 //   COLLATERAL_REGISTRY = { "<pkg>::<mod>::<TYPE>": { "feedId":"0x…", "ltvBps":4000, "decimals":8 } }
-const REGISTRY = JSON.parse(process.env.COLLATERAL_REGISTRY || "{}");
+// Null-prototype: a plain object literal would let `assetFor("constructor")` / `"__proto__"`
+// return an inherited function instead of throwing, and the LTV check downstream compares
+// against NaN — which is always false, i.e. it fails OPEN. (Audit: latent, surfaced in review.)
+const REGISTRY = Object.assign(Object.create(null), JSON.parse(process.env.COLLATERAL_REGISTRY || "{}"));
 function assetFor(coinType) {
-  const a = REGISTRY[coinType];
-  if (!a) throw new Error(`collateral ${coinType} is not an allowed market`);
-  return a;
+  if (typeof coinType !== "string" || !Object.hasOwn(REGISTRY, coinType)) {
+    throw new Error(`collateral ${coinType} is not an allowed market`);
+  }
+  return REGISTRY[coinType];
 }
 const posFinite = (n) => typeof n === "number" && Number.isFinite(n) && n > 0;
 
@@ -152,15 +170,31 @@ app.post("/borrow", async (req, res) => {
     const debtBase = BigInt(Math.round(debtUsdc * 1e6)); // TUSDC/USDC 6-dec
     const collateralBase = BigInt(Math.round(collateralAmount));
     const loanCommit = freshCommit();
-    // bind the collateral TYPE into the attestation (audit CRITICAL: prevents collateral substitution)
-    const attestation = await signAttestation(operator, borrower, debtBase, collateralBase, loanCommit, collateralMint);
+    // AUDIT F2.1 — the attestation is priced at THIS instant, so it must die quickly. The oracle
+    // policy above (maxStaleSecs 60) only constrains the moment of signing; without an expiry the
+    // borrower could hold this signature through a drawdown and redeem it at the stale peak price.
+    const expiryS = BigInt(Math.floor(Date.now() / 1000) + ATTEST_TTL_S);
+    // Binds collateral TYPE (collateral substitution), stable TYPE + POOL (cross-pool replay),
+    // expiry (stale-price redemption), and loan_commit (one-shot nullifier, enforced on-chain).
+    const attestation = await signAttestation(operator, {
+      poolId: POOL_ID,
+      borrower,
+      debt: debtBase,
+      collateralAmount: collateralBase,
+      loanCommit,
+      expiryS,
+      collateralType: collateralMint,
+      stableType: STABLE_TYPE,
+    });
 
     res.json({
       attestation: toHex(attestation),
       operatorPubkey: OPERATOR_PUBKEY_HEX,
+      poolId: POOL_ID,
       debtBase: debtBase.toString(),
       collateralBase: collateralBase.toString(),
       loanCommit: loanCommit.toString(),
+      expiryS: expiryS.toString(),
       authorized: auth.line,
       authMode: auth.authMode,
       priceUsd: Number(ora.price) / 100,

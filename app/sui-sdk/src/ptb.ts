@@ -68,7 +68,9 @@ export function disburseAttested(
   tx: Transaction,
   o: {
     pkg: string; collType: string; stableType: string; pool: string;
-    collateralCoin: TransactionArgument; debt: bigint; loanCommit: bigint; attestation: Uint8Array;
+    collateralCoin: TransactionArgument; debt: bigint; loanCommit: bigint;
+    /** Unix seconds; must match the signed attestation and be within MAX_ATTEST_WINDOW_S. */
+    expiryS: bigint; attestation: Uint8Array;
   },
 ) {
   tx.moveCall({
@@ -79,6 +81,7 @@ export function disburseAttested(
       o.collateralCoin,
       tx.pure.u64(o.debt),
       tx.pure.u256(o.loanCommit),
+      tx.pure.u64(o.expiryS),
       tx.pure.vector("u8", Array.from(o.attestation)),
       tx.object(CLOCK_ID),
     ],

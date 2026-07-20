@@ -136,10 +136,17 @@ export function useBorrow() {
       if (!res.ok) throw new Error(j.detail || j.error || "borrow refused");
       const tx = new Transaction();
       const coll = await exactCoin(tx, client, account.address, args.collateralType, BigInt(j.collateralBase));
+      // The attestation is short-lived (audit F2): the operator prices it at signing time and the
+      // contract rejects it past `expiryS`. If the user sits on the wallet prompt it expires and
+      // the tx aborts with EAttestExpired — surface that as a retry rather than a cryptic failure.
+      const expiryS = BigInt(j.expiryS);
+      if (BigInt(Math.floor(Date.now() / 1000)) >= expiryS) {
+        throw new Error("quote expired before signing — please try again");
+      }
       ptb.disburseAttested(tx, {
         pkg: PKG!, collType: args.collateralType, stableType: STABLE_TYPE, pool: POOL_ID!,
         collateralCoin: coll, debt: BigInt(j.debtBase), loanCommit: BigInt(j.loanCommit),
-        attestation: fromHex(j.attestation),
+        expiryS, attestation: fromHex(j.attestation),
       });
       const r = await signAndExecute({ transaction: tx });
       await client.waitForTransaction({ digest: r.digest });

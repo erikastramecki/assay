@@ -14,13 +14,24 @@ echo "pre-build dregg_borrow…"
 # SSPX priced off the 24/7 BTC feed so the loan authorizes regardless of US market hours
 REG=$(python3 -c "import json;print(json.dumps({'$COINS::sspx::SSPX':{'feedId':'$BTC_FEED','ltvBps':4000,'decimals':8}}))")
 pkill -f server-sui.mjs 2>/dev/null; sleep 1
-( cd "$HERE" && COLLATERAL_REGISTRY="$REG" PORT=8788 node --import tsx server-sui.mjs >/tmp/op-sui.log 2>&1 & )
+
+export SUI_PRIVKEY=$(sui keytool export --key-identity "$(sui client active-address)" --json 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin)['exportedPrivateKey'])")
+COMMON="LENDING=$LENDING COINS=$COINS CAP_USDC=$CAP_USDC CAP_SSPX=$CAP_SSPX API_URL=http://127.0.0.1:8788"
+
+# phase 1: create the pool BEFORE the operator boots — attestations bind the pool id (audit F2.3),
+# so the operator needs POOL_ID at startup and the pool needs the operator pubkey (read from keyfile).
+INIT=$(env $COMMON node --import tsx "$HERE/test-borrow-sui.mjs" init 2>&1 | grep -vE "ExperimentalWarning|--import|node:internal")
+echo "$INIT"
+POOL=$(echo "$INIT" | grep -oE "^POOL=0x[0-9a-f]+" | cut -d= -f2)
+[ -z "$POOL" ] && { echo "init phase produced no pool"; exit 1; }
+
+( cd "$HERE" && COLLATERAL_REGISTRY="$REG" PORT=8788 POOL_ID="$POOL" STABLE_TYPE="$COINS::tusdc::TUSDC" \
+  node --import tsx server-sui.mjs >/tmp/op-sui.log 2>&1 & )
 for i in $(seq 1 20); do curl -s http://127.0.0.1:8788/health >/dev/null 2>&1 && break; sleep 1; done
 curl -s http://127.0.0.1:8788/health; echo
 
-export SUI_PRIVKEY=$(sui keytool export --key-identity "$(sui client active-address)" --json 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin)['exportedPrivateKey'])")
-LENDING=$LENDING COINS=$COINS CAP_USDC=$CAP_USDC CAP_SSPX=$CAP_SSPX API_URL=http://127.0.0.1:8788 \
-  node --import tsx "$HERE/test-borrow-sui.mjs" 2>&1 | grep -vE "ExperimentalWarning|--import|node:internal"
+# phase 2: quote + borrow against that pool, using the running operator's attestation
+env $COMMON POOL="$POOL" node --import tsx "$HERE/test-borrow-sui.mjs" borrow 2>&1 | grep -vE "ExperimentalWarning|--import|node:internal"
 RC=${PIPESTATUS[0]}
 unset SUI_PRIVKEY
 pkill -f server-sui.mjs 2>/dev/null

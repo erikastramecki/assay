@@ -192,22 +192,107 @@ module dregg_lending_async::async_lending_tests {
         clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
     }
 
+    // ---- attested-disburse guards (audit F2) ----------------------------------------------
+    // A valid ed25519 signature can't be produced inside a Move test, so each guard is proven by
+    // showing it aborts with ITS OWN code while carrying a forged signature — i.e. it rejects
+    // before `ed25519_verify` would. The positive path is exercised on-chain in the harness.
+
+    const FORGED: vector<u8> = x"01010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101";
+
+    /// Pool + funded liquidity + a clock parked at `now_ms`.
+    fun attest_fixture(now_ms: u64, ctx: &mut TxContext): (al::Pool<USDC>, al::OperatorCap, clock::Clock) {
+        let mut clk = clock::create_for_testing(ctx);
+        clock::set_for_testing(&mut clk, now_ms);
+        let (mut pool, cap) = al::new_pool<USDC>(0, 0, 0, 8000, 0, 1_000_000_000_000, 0, vk(), opk(), &clk, ctx);
+        al::deposit(&mut pool, coin::mint_for_testing<USDC>(1_000_000_000, ctx), &clk, ctx);
+        (pool, cap, clk)
+    }
+
     #[test]
     #[expected_failure(abort_code = al::EBadAttest)]
     fun disburse_attested_rejects_forged_attestation() {
         let mut ctx = tx_context::dummy();
-        let clk = clock::create_for_testing(&mut ctx);
-        let (mut pool, cap) = al::new_pool<USDC>(0, 0, 0, 8000, 0, 1_000_000_000_000, 0, vk(), opk(), &clk, &mut ctx);
-        al::deposit(&mut pool, coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), &clk, &mut ctx);
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
         // a forged 64-byte ed25519 signature must NOT authorize a non-custodial disburse
         al::disburse_attested<SSPX, USDC>(
             &mut pool, coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx),
-            500_000_000, 42u256,
-            x"01010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101",
-            &clk, &mut ctx);
+            500_000_000, 42u256, 60, FORGED, &clk, &mut ctx);
         // unreachable
-        clock::destroy_for_testing(clk);
-        test_utils::destroy(pool);
-        test_utils::destroy(cap);
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = al::EAttestExpired)]
+    fun disburse_attested_rejects_expired_attestation() {
+        let mut ctx = tx_context::dummy();
+        // clock at t=1000s, attestation expired at t=900s. This is the stale-price attack: hold a
+        // peak-priced signature through a drawdown, then redeem it. Must abort BEFORE verify.
+        let (mut pool, cap, clk) = attest_fixture(1_000_000, &mut ctx);
+        al::disburse_attested<SSPX, USDC>(
+            &mut pool, coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx),
+            500_000_000, 42u256, 900, FORGED, &clk, &mut ctx);
+        // unreachable
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = al::EAttestWindow)]
+    fun disburse_attested_rejects_overlong_window() {
+        let mut ctx = tx_context::dummy();
+        // t=0, expiry a year out — a de-facto perpetual bearer authorization. Capped at 120s.
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        al::disburse_attested<SSPX, USDC>(
+            &mut pool, coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx),
+            500_000_000, 42u256, 31_536_000, FORGED, &clk, &mut ctx);
+        // unreachable
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = al::EPaused)]
+    fun disburse_attested_rejects_when_paused() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        al::set_paused(&cap, &mut pool, true, &mut ctx); // key-compromise kill switch
+        al::disburse_attested<SSPX, USDC>(
+            &mut pool, coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx),
+            500_000_000, 42u256, 60, FORGED, &clk, &mut ctx);
+        // unreachable
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    /// CROSS-LANGUAGE PIN (audit F2). The operator signs in TypeScript; the contract verifies in
+    /// Move. If the two preimages diverge by a single byte every signature fails verify — closed,
+    /// but silently, and it would look like a key problem rather than an encoding problem.
+    /// The expected bytes below were emitted by `app/sui-sdk/src/attest.ts::attestationMessage`
+    /// for these exact inputs. If this test fails, the two layouts have drifted apart — fix the
+    /// mismatch, do NOT re-baseline this constant to whatever Move currently produces.
+    #[test]
+    fun attest_msg_matches_typescript_byte_for_byte() {
+        let expected: vector<u8> = x"00000000000000000000000000000000000000000000000000000000000000bb0065cd1d0000000000e87648170000002a000000000000000000000000000000000000000000000000000000000000003c0000000000000000000000000000000000000000000000000000000000000000000000000000aa5b303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303a3a6173796e635f6c656e64696e675f74657374733a3a535350585b303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303a3a6173796e635f6c656e64696e675f74657374733a3a55534443";
+        let actual = al::attest_msg_for_testing<SSPX, USDC>(
+            object::id_from_address(@0xaa), // pool
+            @0xbb,                          // borrower
+            500_000_000,                    // debt
+            100_000_000_000,                // coll_amt
+            42u256,                         // loan_commit
+            60,                             // expiry_s
+        );
+        assert!(actual == expected, 0);
+    }
+
+    #[test]
+    fun pause_and_rotate_are_cap_gated_and_observable() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        assert!(!al::is_paused(&pool), 0);
+        al::set_paused(&cap, &mut pool, true, &mut ctx);
+        assert!(al::is_paused(&pool), 1);
+        al::set_paused(&cap, &mut pool, false, &mut ctx);
+        assert!(!al::is_paused(&pool), 2);
+        // rotation invalidates every outstanding attestation signed by the old key
+        al::set_operator_pubkey(&cap, &mut pool, x"0202020202020202020202020202020202020202020202020202020202020202", &mut ctx);
+        assert!(!al::commit_used(&pool, 42u256), 3); // nothing disbursed yet
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
     }
 }

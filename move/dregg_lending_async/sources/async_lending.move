@@ -26,6 +26,15 @@ module dregg_lending_async::async_lending {
     const ENotBorrower: u64 = 0xB0B; // repay must be sent by the position's borrower
     const EBadKink: u64 = 0xC17;     // kink utilization must be in (0, 10000) bps
     const EOverCollateralCap: u64 = 0xC01; // this collateral's borrows would exceed its isolation cap
+    const EAttestExpired: u64 = 0xA78;  // attestation's expiry_s has passed (audit F2.1)
+    const EAttestReplay: u64 = 0xA79;   // this loan_commit was already disbursed (audit F2.2)
+    const EPaused: u64 = 0xA7A;         // pool is paused; attested disburse disabled (audit F2.4)
+    const EAttestWindow: u64 = 0xA7B;   // expiry_s is further out than MAX_ATTEST_WINDOW_S
+
+    /// Longest life an attestation may be signed for. The operator's oracle discipline
+    /// (pyth.mjs: maxStaleSecs 60) only constrains the INSTANT of signing, so the on-chain
+    /// window must be short or a signature becomes an option on a stale price (audit F2).
+    const MAX_ATTEST_WINDOW_S: u64 = 120;
 
     const INDEX_ONE: u256 = 1_000_000_000_000_000_000; // 1e18 fixed-point
     const SECS_PER_YEAR: u256 = 31_536_000;
@@ -69,6 +78,13 @@ module dregg_lending_async::async_lending {
         // (possibly manipulated) collateral can never draw more than its cap from the shared pool.
         collateral_borrowed: Table<TypeName, u64>,
         per_collateral_cap: u64,            // 0 = unlimited
+        // REPLAY (audit F2.2): every loan_commit that has been disbursed under an attestation.
+        // Without this an attestation is a bearer instrument redeemable an unbounded number of
+        // times. Mirrors `dregg_lending::lending`'s `used` nullifier table, which was already correct.
+        used_commits: Table<u256, bool>,
+        // PAUSE (audit F2.4): kill-switch for the attested path. There was previously no way to
+        // revoke outstanding attestations after an operator-key compromise.
+        paused: bool,
     }
 
     /// A PENDING loan: collateral locked, principal + borrow-index snapshot recorded.
@@ -153,6 +169,8 @@ module dregg_lending_async::async_lending {
             operator_pubkey,
             collateral_borrowed: table::new(ctx),
             per_collateral_cap,
+            used_commits: table::new(ctx),
+            paused: false,
         };
         (pool, OperatorCap { id: object::new(ctx) })
     }
@@ -292,36 +310,117 @@ module dregg_lending_async::async_lending {
         transfer::share_object(pos);
     }
 
+    /// The exact byte string the operator signs. Kept as one function so the preimage has a
+    /// single definition on-chain and `app/sui-sdk/src/attest.ts` mirrors this layout exactly.
+    ///
+    ///   bcs(borrower:address)   32
+    /// ‖ bcs(debt:u64)            8
+    /// ‖ bcs(coll_amt:u64)        8
+    /// ‖ bcs(loan_commit:u256)   32
+    /// ‖ bcs(expiry_s:u64)        8   (audit F2.1 — temporal binding)
+    /// ‖ bcs(pool_id:ID)         32   (audit F2.3 — domain separation across pools)
+    /// ‖ bcs(collateral_type)   ULEB-prefixed
+    /// ‖ bcs(stable_type)       ULEB-prefixed  (audit F2.3)
+    ///
+    /// CANONICALIZATION: the two type names are length-prefixed via `bcs::to_bytes` on the
+    /// ascii::String rather than raw-appended. Raw concatenation of two variable-length tails is
+    /// ambiguous — ("AB","C") and ("A","BC") would produce identical bytes, letting one signature
+    /// authorize a different (collateral, stable) pair. The prefix makes the parse unique.
+    fun attest_msg<Collateral, Stable>(
+        pool_id: ID, borrower: address, debt: u64, coll_amt: u64, loan_commit: u256, expiry_s: u64,
+    ): vector<u8> {
+        let mut msg = sui::bcs::to_bytes(&borrower);
+        vector::append(&mut msg, sui::bcs::to_bytes(&debt));
+        vector::append(&mut msg, sui::bcs::to_bytes(&coll_amt));
+        vector::append(&mut msg, sui::bcs::to_bytes(&loan_commit));
+        vector::append(&mut msg, sui::bcs::to_bytes(&expiry_s));
+        vector::append(&mut msg, sui::bcs::to_bytes(&pool_id));
+        // SECURITY (audit CRITICAL, pre-existing and correct): bind the collateral TYPE, not just
+        // the amount. Otherwise an attacker could take an attestation the operator signed for a
+        // valuable collateral and present the same unit-count of a WORTHLESS coin type.
+        vector::append(&mut msg, sui::bcs::to_bytes(&type_name::into_string(type_name::get<Collateral>())));
+        // And bind the borrowed asset too, so a signature for a TUSDC pool cannot be spent at a
+        // pool denominated in something else that happens to pin the same operator key.
+        vector::append(&mut msg, sui::bcs::to_bytes(&type_name::into_string(type_name::get<Stable>())));
+        msg
+    }
+
     /// NON-CUSTODIAL disburse (the web/app path). The BORROWER sends this tx and supplies
     /// their own collateral; the operator's dregg authorization is an ed25519 `attestation`
     /// over the exact loan terms, verified in-Move against the pool's pinned operator pubkey.
-    /// No OperatorCap needed → no two-party tx, no custody. The signed message is:
-    ///   bcs(borrower:address) ‖ bcs(debt:u64) ‖ bcs(collateral_amount:u64) ‖ bcs(loan_commit:u256)
-    /// so a signature can only ever disburse the terms the operator actually approved.
+    /// No OperatorCap needed → no two-party tx, no custody.
+    ///
+    /// The attestation is single-use and short-lived (see `attest_msg`). There is NO on-chain
+    /// oracle or LTV check anywhere in this module — the attestation IS the solvency gate, which
+    /// is exactly why it must be bound to a time, a pool, and a one-shot nullifier. Before the
+    /// audit it was none of those: a perpetual bearer authorization redeemable at a frozen price.
     public entry fun disburse_attested<Collateral, Stable>(
         pool: &mut Pool<Stable>,
         collateral: Coin<Collateral>,
         debt: u64,
         loan_commit: u256,
+        expiry_s: u64,
         attestation: vector<u8>,
         clock: &Clock,
         ctx: &mut TxContext,
     ) {
+        assert!(!pool.paused, EPaused);
+        let now = now_s(clock);
+        // F2.1 — TEMPORAL BINDING. Without this, a borrower polls /borrow at a price peak, sits on
+        // the signature, and submits it after a drawdown to receive a peak-priced loan that is
+        // insolvent the moment it opens. The upper bound stops the operator (or a compromised
+        // signer) from minting a de-facto perpetual attestation by naming a far-future expiry.
+        assert!(now <= expiry_s, EAttestExpired);
+        assert!(expiry_s <= now + MAX_ATTEST_WINDOW_S, EAttestWindow);
+        // F2.2 — REPLAY. One commit, one disbursement, forever.
+        assert!(!table::contains(&pool.used_commits, loan_commit), EAttestReplay);
+
         let borrower = ctx.sender();
         let coll_amt = coin::value(&collateral);
-        let mut msg = sui::bcs::to_bytes(&borrower);
-        vector::append(&mut msg, sui::bcs::to_bytes(&debt));
-        vector::append(&mut msg, sui::bcs::to_bytes(&coll_amt));
-        vector::append(&mut msg, sui::bcs::to_bytes(&loan_commit));
-        // SECURITY (audit CRITICAL): bind the collateral TYPE, not just the amount. Otherwise an
-        // attacker could take an attestation the operator signed for a valuable collateral and
-        // present the same unit-count of a WORTHLESS coin type — borrowing against junk. The
-        // operator signs the exact collateral type; the contract reconstructs it from the type param.
-        vector::append(&mut msg, type_name::into_string(type_name::get<Collateral>()).into_bytes());
+        let msg = attest_msg<Collateral, Stable>(
+            object::id(pool), borrower, debt, coll_amt, loan_commit, expiry_s,
+        );
         assert!(sui::ed25519::ed25519_verify(&attestation, &pool.operator_pubkey, &msg), EBadAttest);
+
+        table::add(&mut pool.used_commits, loan_commit, true);
         let (loan, pos) = disburse_inner<Collateral, Stable>(pool, collateral, debt, borrower, loan_commit, clock, ctx);
         transfer::public_transfer(loan, borrower);
         transfer::share_object(pos);
+    }
+
+    /// GOVERNANCE (OperatorCap-gated): rotate the pinned operator pubkey. Rotating invalidates
+    /// every outstanding attestation signed by the old key — the revocation path that did not
+    /// exist before the audit (F2.4). Use together with `set_paused` on a suspected key compromise.
+    public entry fun set_operator_pubkey<Stable>(
+        _cap: &OperatorCap, pool: &mut Pool<Stable>, operator_pubkey: vector<u8>, _ctx: &mut TxContext,
+    ) {
+        pool.operator_pubkey = operator_pubkey;
+    }
+
+    /// GOVERNANCE (OperatorCap-gated): pause/unpause the attested disburse path (F2.4).
+    /// Deliberately does NOT block `repay` or withdrawals — a pause must never trap borrowers'
+    /// collateral or lenders' funds.
+    public entry fun set_paused<Stable>(
+        _cap: &OperatorCap, pool: &mut Pool<Stable>, paused: bool, _ctx: &mut TxContext,
+    ) {
+        pool.paused = paused;
+    }
+
+    /// Has this loan_commit already been disbursed? (indexers + SDK preflight)
+    public fun commit_used<Stable>(pool: &Pool<Stable>, loan_commit: u256): bool {
+        table::contains(&pool.used_commits, loan_commit)
+    }
+
+    /// Is the attested disburse path currently paused?
+    public fun is_paused<Stable>(pool: &Pool<Stable>): bool { pool.paused }
+
+    /// Exposes the signed preimage so the cross-language byte-equality test can pin it against
+    /// `app/sui-sdk/src/attest.ts`. A divergence there fails every signature closed, but silently.
+    #[test_only]
+    public fun attest_msg_for_testing<Collateral, Stable>(
+        pool_id: ID, borrower: address, debt: u64, coll_amt: u64, loan_commit: u256, expiry_s: u64,
+    ): vector<u8> {
+        attest_msg<Collateral, Stable>(pool_id, borrower, debt, coll_amt, loan_commit, expiry_s)
     }
 
     /// Current debt = principal · index_now / index_at_borrow (after accrual).
