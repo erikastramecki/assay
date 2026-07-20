@@ -5,7 +5,7 @@ mockup). Here's exactly what runs, and one command to see it all go green.
 
 ## The one command
 ```
-cd rwa-marketplace && ./test-all.sh
+./test-all.sh
 ```
 It spins up a local Solana validator, deploys the program fresh, and runs every flow,
 printing a green/red line per capability. ~3–5 min. (Needs: the Solana CLI + `cargo-build-sbf`,
@@ -41,7 +41,7 @@ node pool_flow.mjs      "$PROG"
 node async_flow.mjs     "$PROG"   # (fresh program id each — re-deploy between runs)
 node liquidate_flow.mjs "$PROG"
 ```
-(`test-all.sh` automates the deploy-fresh-per-flow dance.)
+(`test-all.sh` runs every Move package, the SDK unit tests, the web typecheck and shell syntax. Live devnet flows — the pentest suite and the operator borrow path — need SUI_PRIVKEY and a deployed package, and are listed at the bottom of that script.)
 
 ## What you CANNOT test yet (because it isn't built)
 - Clicking anything in a real Assay web app — **no frontend exists** (the Artifact is a mockup).

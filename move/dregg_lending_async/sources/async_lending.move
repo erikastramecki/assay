@@ -633,6 +633,15 @@ module dregg_lending_async::async_lending {
         settle_public_input(pool)
     }
 
+    /// Settle without a proof, so the exposure-ledger interaction can be tested (the batch
+    /// circuit must be re-proven before a real settle can succeed).
+    #[test_only]
+    public fun force_settle_for_testing<Stable>(pool: &mut Pool<Stable>) {
+        pool.last_settled = pool.current_batch;
+        pool.current_batch = pool.current_batch + 1;
+        pool.batch_root = 0;
+    }
+
     #[test_only]
     public fun set_current_batch_for_testing<Stable>(pool: &mut Pool<Stable>, b: u64) { pool.current_batch = b; }
 
@@ -868,7 +877,13 @@ module dregg_lending_async::async_lending {
         pool.last_settled = pool.current_batch;
         pool.current_batch = pool.current_batch + 1;
         pool.batch_root = 0;
-        pool.total_pending = 0;
+        // DELIBERATELY does NOT zero total_pending (audit R6). Since release_exposure debits it
+        // per-loan on repay/liquidate, a wholesale reset here double-releases: repaying a loan
+        // whose batch already settled debits exposure the ledger no longer holds, and pool.cap
+        // becomes breachable without bound. total_pending now means OPEN DISBURSED PRINCIPAL,
+        // credited at disburse and debited exactly once when that loan closes, so pool.cap bounds
+        // concurrent exposure rather than per-batch unproven exposure. Settling proves a batch; it
+        // does not close its loans.
     }
 
     // ---- views (tests / indexers) ----
@@ -877,6 +892,7 @@ module dregg_lending_async::async_lending {
     public fun pool_reserves<Stable>(p: &Pool<Stable>): u64 { p.total_reserves }
     public fun per_collateral_cap<Stable>(p: &Pool<Stable>): u64 { p.per_collateral_cap }
     public fun batch_root_of<Stable>(p: &Pool<Stable>): u256 { p.batch_root }
+    public fun total_pending_of<Stable>(p: &Pool<Stable>): u64 { p.total_pending }
     public fun current_batch_of<Stable>(p: &Pool<Stable>): u64 { p.current_batch }
     public fun collateral_borrowed_of<Collateral, Stable>(p: &Pool<Stable>): u64 {
         let ct = type_name::get<Collateral>();

@@ -475,6 +475,78 @@ module dregg_lending_async::async_lending_tests {
         test_utils::destroy(pool_b); test_utils::destroy(cap_b);
     }
 
+    /// R6 REGRESSION — settle_batch must NOT zero total_pending. release_exposure debits it
+    /// per-loan, so a wholesale reset double-releases and pool.cap stops binding.
+    #[test]
+    fun settling_does_not_double_release_exposure() {
+        let mut ctx = tx_context::dummy();
+        let clk = clock::create_for_testing(&mut ctx);
+        let (mut pool, cap) = al::new_pool<USDC>(0, 0, 0, 8000, 0, 200_000_000, 0, vk(), opk(), &clk, &mut ctx);
+        al::deposit(&mut pool, coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), &clk, &mut ctx);
+        let (l1, p1) = al::disburse<SSPX, USDC>(&cap, &mut pool,
+            coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx), 100_000_000, ctx.sender(), 1u256, &clk, &mut ctx);
+        assert!(al::total_pending_of(&pool) == 100_000_000, 0);
+        // settle would previously zero the ledger; the loan is still OPEN, so its exposure must stay
+        al::force_settle_for_testing(&mut pool);
+        assert!(al::total_pending_of(&pool) == 100_000_000, 1);
+        // closing it releases exactly once
+        let c1 = al::repay<SSPX, USDC>(&mut pool, p1, coin::mint_for_testing<USDC>(100_000_000, &mut ctx), &clk, &mut ctx);
+        assert!(al::total_pending_of(&pool) == 0, 2);
+        coin::burn_for_testing(l1); coin::burn_for_testing(c1);
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    /// R6 — the global exposure cap itself had NO test: deleting the EOverCap assert left the
+    /// whole suite green. This is the ledger round 5 was written to keep alive.
+    #[test]
+    #[expected_failure(abort_code = al::EOverCap)]
+    fun global_cap_blocks_borrowing_beyond_it() {
+        let mut ctx = tx_context::dummy();
+        let clk = clock::create_for_testing(&mut ctx);
+        let (mut pool, cap) = al::new_pool<USDC>(0, 0, 0, 8000, 0, 150_000_000, 0, vk(), opk(), &clk, &mut ctx);
+        al::deposit(&mut pool, coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), &clk, &mut ctx);
+        let (l1, p1) = al::disburse<SSPX, USDC>(&cap, &mut pool,
+            coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx), 100_000_000, ctx.sender(), 1u256, &clk, &mut ctx);
+        // 100 + 100 > 150 cap -> must abort
+        let (l2, p2) = al::disburse<SSPX, USDC>(&cap, &mut pool,
+            coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx), 100_000_000, ctx.sender(), 2u256, &clk, &mut ctx);
+        // unreachable
+        coin::burn_for_testing(l1); coin::burn_for_testing(l2);
+        test_utils::destroy(p1); test_utils::destroy(p2);
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    /// R6 — the per-collateral isolation release had no test either: deleting it made the
+    /// isolation cap monotonic-for-life, the exact bug R5-3 fixed for total_pending.
+    #[test]
+    fun repaying_frees_the_per_collateral_isolation_slot() {
+        let mut ctx = tx_context::dummy();
+        let clk = clock::create_for_testing(&mut ctx);
+        let (mut pool, cap) = al::new_pool<USDC>(0, 0, 0, 8000, 0, 1_000_000_000_000, 100_000_000, vk(), opk(), &clk, &mut ctx);
+        al::deposit(&mut pool, coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), &clk, &mut ctx);
+        let (l1, p1) = al::disburse<SSPX, USDC>(&cap, &mut pool,
+            coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx), 100_000_000, ctx.sender(), 1u256, &clk, &mut ctx);
+        assert!(al::collateral_borrowed_of<SSPX, USDC>(&pool) == 100_000_000, 0);
+        let c1 = al::repay<SSPX, USDC>(&mut pool, p1, coin::mint_for_testing<USDC>(100_000_000, &mut ctx), &clk, &mut ctx);
+        assert!(al::collateral_borrowed_of<SSPX, USDC>(&pool) == 0, 1);
+        // a second SSPX loan of the same size must fit again
+        let (l2, p2) = al::disburse<SSPX, USDC>(&cap, &mut pool,
+            coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx), 100_000_000, ctx.sender(), 2u256, &clk, &mut ctx);
+        coin::burn_for_testing(l1); coin::burn_for_testing(l2); coin::burn_for_testing(c1);
+        test_utils::destroy(p2);
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = al::ENoPendingKey)]
+    fun commit_rotation_requires_a_pending_proposal() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        al::commit_operator_pubkey(&cap, &mut pool, &clk, &mut ctx); // nothing proposed
+        // unreachable
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
     #[test]
     fun attest_msg_matches_typescript_byte_for_byte() {
         let expected: vector<u8> = x"1141535341595F44495342555253455F563100000000000000000000000000000000000000000000000000000000000000BB0065CD1D0000000000E87648170000002A000000000000000000000000000000000000000000000000000000000000003C0000000000000000000000000000000000000000000000000000000000000000000000000000AA5B303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303A3A6173796E635F6C656E64696E675F74657374733A3A535350585B303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303A3A6173796E635F6C656E64696E675F74657374733A3A55534443";
