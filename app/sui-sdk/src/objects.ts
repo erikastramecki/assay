@@ -26,6 +26,8 @@ export interface PoolView {
 
 export interface PositionView {
   id: string;
+  /** The pool this position is bound to. repay/liquidate abort with EWrongPool against any other. */
+  poolId: string;
   borrower: string;
   principal: bigint;
   indexSnapshot: bigint;
@@ -77,16 +79,19 @@ export async function sharesOf(client: SuiClient, sharesTableId: string, addr: s
 }
 
 /** ALL live positions in the pool (for the liquidation keeper) — every LoanOpened, still-open. */
-export async function allOpenPositions(client: SuiClient, pkg: string): Promise<PositionView[]> {
-  return positionsFromEvents(client, pkg, null);
+export async function allOpenPositions(client: SuiClient, pkg: string, poolId?: string): Promise<PositionView[]> {
+  return positionsFromEvents(client, pkg, null, poolId);
 }
 
 /** Discover a borrower's live positions via the `LoanOpened` event (positions are shared). */
-export async function findPositions(client: SuiClient, pkg: string, borrower: string): Promise<PositionView[]> {
-  return positionsFromEvents(client, pkg, normalizeSuiAddress(borrower));
+export async function findPositions(client: SuiClient, pkg: string, borrower: string, poolId?: string): Promise<PositionView[]> {
+  return positionsFromEvents(client, pkg, normalizeSuiAddress(borrower), poolId);
 }
 
-async function positionsFromEvents(client: SuiClient, pkg: string, borrower: string | null): Promise<PositionView[]> {
+// `poolId` filters to one pool. Positions are bound to their pool on-chain (repay/liquidate abort
+// with EWrongPool against any other), so listing across pools yields entries the caller can only
+// fail to act on. Optional so existing all-pools callers (the keeper) keep working.
+async function positionsFromEvents(client: SuiClient, pkg: string, borrower: string | null, poolId?: string): Promise<PositionView[]> {
   const evs = await client.queryEvents({
     query: { MoveEventType: `${pkg}::${MODULE}::LoanOpened` },
     limit: 500,
@@ -96,6 +101,7 @@ async function positionsFromEvents(client: SuiClient, pkg: string, borrower: str
     ...new Set(
       evs.data
         .filter((e) => borrower === null || normalizeSuiAddress((e.parsedJson as any).borrower) === borrower)
+        .filter((e) => !poolId || normalizeSuiAddress((e.parsedJson as any).pool) === normalizeSuiAddress(poolId))
         .map((e) => (e.parsedJson as any).position as string),
     ),
   ];
@@ -110,6 +116,7 @@ async function positionsFromEvents(client: SuiClient, pkg: string, borrower: str
     out.push({
       id,
       borrower: normalizeSuiAddress(f.borrower),
+      poolId: normalizeSuiAddress(f.pool_id),
       principal: BigInt(f.principal),
       indexSnapshot: BigInt(f.index_snapshot),
       batchId: BigInt(f.batch_id),

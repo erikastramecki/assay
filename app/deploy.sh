@@ -9,8 +9,6 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WEB="$HERE/web"; OPDIR="$HERE/operator-api"; OPV="$OPDIR/assay-operator"
 WEB_ALIAS=assay-sui.vercel.app; OP_ALIAS=assay-operator-sui.vercel.app
-BANNER="import { createRequire as __cr } from 'module'; import { fileURLToPath as __fp } from 'url'; import { dirname as __dn } from 'path'; const require = __cr(import.meta.url); const __filename = __fp(import.meta.url); const __dirname = __dn(__filename);"
-REWRITE='{ "rewrites": [{ "source": "/((?!assets/|favicon).*)", "destination": "/index.html" }] }'
 fail() { echo "❌ $1"; exit 1; }
 . "$HERE/lib-operator-env.sh"
 
@@ -29,23 +27,16 @@ if [ "$run_test" = 1 ]; then echo "── preflight: sui move test ──"
 if [ "$do_op" = 1 ]; then
   echo "── operator: bundle + deploy ──"
   provision_operator_env "$WEB" "$OPV" || fail "operator env provisioning failed"
-  ( cd "$OPDIR" && ./node_modules/.bin/esbuild server-sui.mjs --bundle --platform=node --format=esm --target=node20 \
-      --outfile=assay-operator/api/index.mjs --log-level=error --banner:js="$BANNER" ) || fail "operator bundle failed"
-  U=$( cd "$OPV" && vercel deploy --prod --yes 2>/dev/null | grep -oE "https://assay-operator-[a-z0-9-]+\.vercel\.app" | head -1 )
-  [ -z "$U" ] && fail "operator deploy produced no URL"
-  ( cd "$OPV" && vercel alias set "$U" "$OP_ALIAS" >/dev/null 2>&1 ) || fail "operator alias set failed (smoke would validate the PREVIOUS deploy)"
-  echo "   operator → https://$OP_ALIAS"
+  bundle_operator "$OPDIR" || fail "operator bundle failed"
+  deploy_and_alias "$OPV" "https://assay-operator-[a-z0-9-]+\.vercel\.app" "$OP_ALIAS" || fail "operator deploy/alias failed"
 fi
 
 # ---- web ----
 if [ "$do_web" = 1 ]; then
   echo "── web: gen-docs + build + deploy ──"
   ( cd "$WEB" && node gen-docs.mjs >/dev/null && npx vite build >/dev/null 2>&1 ) || fail "web build failed"
-  printf '%s' "$REWRITE" > "$WEB/dist/vercel.json"
-  U=$( cd "$WEB/dist" && vercel deploy --prod --yes 2>/dev/null | grep -oE "https://[a-z0-9-]+\.vercel\.app" | tail -1 )
-  [ -z "$U" ] && fail "web deploy produced no URL"
-  ( cd "$WEB/dist" && vercel alias set "$U" "$WEB_ALIAS" >/dev/null 2>&1 ) || fail "web alias set failed (smoke would validate the PREVIOUS deploy)"
-  echo "   web → https://$WEB_ALIAS"
+  printf '%s' "$SPA_REWRITE" > "$WEB/dist/vercel.json"
+  deploy_and_alias "$WEB/dist" "https://[a-z0-9-]+\.vercel\.app" "$WEB_ALIAS" || fail "web deploy/alias failed"
 fi
 
 # ---- smoke ----

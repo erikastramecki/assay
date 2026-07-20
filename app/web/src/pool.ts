@@ -201,7 +201,7 @@ export function usePositions() {
     try {
       const pool = await readPool(client, POOL_ID!);
       const idx = accrueIndex(pool, nowS());
-      const found = await findPositions(client, PKG!, account.address);
+      const found = await findPositions(client, PKG!, account.address, POOL_ID!); // this pool only — cross-pool positions cannot be repaid here
       setPositions(found.map((f) => ({
         id: f.id,
         collateralType: f.collateralType,

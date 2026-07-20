@@ -425,6 +425,33 @@ module dregg_lending_async::async_lending_tests {
         clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
     }
 
+    /// The borrow_index guard must FREEZE compounding, not abort. Unreachable on a legal curve,
+    /// so the state is forced — without this the guard was untested (reverting it left all green).
+    #[test]
+    fun accrue_freezes_the_index_instead_of_aborting_on_overflow() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        let near_max = 115792089237316195423570985008687907853269984665640564039457584007913129639000u256;
+        al::set_accrual_state_for_testing(&mut pool, near_max, 1_000_000, 0);
+        // one year at a nonzero rate would overflow the multiply; it must no-op, not abort
+        al::set_rate_curve(&cap, &mut pool, 1000, 0, 0, 8000, 0, &clk, &mut ctx);
+        al::accrue_for_testing(&mut pool, 31_536_000);
+        assert!(al::borrow_index_of(&pool) == near_max, 0); // frozen, and we got here at all
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    /// total_borrows must saturate rather than abort, so a bad curve cannot wedge repay/withdraw.
+    #[test]
+    fun accrue_saturates_total_borrows_instead_of_aborting() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        al::set_accrual_state_for_testing(&mut pool, 1_000_000_000_000_000_000, 18_446_744_073_709_551_000, 0);
+        al::set_rate_curve(&cap, &mut pool, 100_000, 0, 0, 8000, 0, &clk, &mut ctx);
+        al::accrue_for_testing(&mut pool, 31_536_000); // a full year at the max legal rate
+        assert!(al::pool_borrows(&pool) == 18_446_744_073_709_551_615, 0); // saturated, not aborted
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
     #[test]
     fun new_pool_rejects_every_low_order_pubkey() {
         let mut ctx = tx_context::dummy();
@@ -443,6 +470,13 @@ module dregg_lending_async::async_lending_tests {
             x"C7176A703D4DD84FBA3C0B760D10670F2A2053FA2C39CCC64EC7FD7792AC037A",
             x"ECFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
             x"0100000000000000000000000000000000000000000000000000000000000080",
+            // the 4 NON-canonical encodings (y_raw = p and p+1, each sign) — two decode to the
+            // identity. Enumerating these is what two earlier revisions got wrong; they are now
+            // caught structurally by the y < p check, and asserted here so that cannot regress.
+            x"EDFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF7F",
+            x"EDFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+            x"EEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF7F",
+            x"EEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
         ];
         let mut i = 0;
         while (i < vector::length(&keys)) {

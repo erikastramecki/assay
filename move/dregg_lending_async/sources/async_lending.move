@@ -72,11 +72,36 @@ module dregg_lending_async::async_lending {
     /// drops out of the equation and ANY signature verifies for ANY message. The all-zero key is
     /// the canonical case and is easy to install by accident (unset env var, truncated paste, an
     /// HSM returning null). A wrong-length key at least fails closed; a low-order key fails OPEN.
-    /// The 8 canonical low-order points (orders 1,2,4,4,8,8,8,8), derived from the curve equation
-    /// rather than recalled — an earlier revision of this list substituted two non-canonical
-    /// encodings for two genuine order-8 points, leaving both forgeable keys accepted. The last
-    /// two entries are non-canonical encodings of low-order points (y=0 written as p, and the
-    /// identity with the sign bit set), rejected too since a decoder may normalize them.
+    /// Reject non-canonical y encodings wholesale. A valid ed25519 public key encodes y < p; any
+    /// y_raw >= p is a second spelling of the same point. There are exactly 14 encodings of
+    /// low-order points — 10 canonical, 4 non-canonical (y_raw = p or p+1, each with either sign
+    /// bit). Two prior revisions of this function tried to ENUMERATE the non-canonical ones and
+    /// got it wrong both times, so this rejects the whole class structurally instead. No
+    /// legitimate key is affected: canonical encoding is required by the spec.
+    fun is_canonical_y(pk: &vector<u8>): bool {
+        let p_le = x"EDFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF7F";
+        let mut i = 32;
+        while (i > 0) {
+            i = i - 1;
+            // the top bit of the last byte is the x-sign flag, not part of y
+            let b = if (i == 31) { *vector::borrow(pk, i) & 0x7F } else { *vector::borrow(pk, i) };
+            let pb = *vector::borrow(&p_le, i);
+            if (b < pb) { return true };
+            if (b > pb) { return false };
+        };
+        false // exactly p — non-canonical
+    }
+
+    /// The 8 canonical low-order points of Curve25519 (orders 1,2,4,4,8,8,8,8) in their 10 valid
+    /// canonical encodings — the extra two are the x=0 points written with the sign bit set.
+    /// Derived from the curve equation, not recalled: an earlier revision substituted junk for two
+    /// genuine order-8 points and left both forgeable keys accepted.
+    ///
+    /// SECURITY (audit R2-3): Sui's `ed25519_verify` is ZIP-215 (cofactored), which ACCEPTS a
+    /// forged signature against a low-order public key — `[8][k]A` is the identity, so the message
+    /// drops out of the equation and ANY signature verifies for ANY message. Easy to install by
+    /// accident (unset env var, truncated paste, an HSM returning null). A wrong-length key fails
+    /// closed; a low-order key fails OPEN.
     fun assert_valid_pubkey(pk: &vector<u8>) {
         assert!(pubkey_is_acceptable(pk), EBadPubkey);
     }
@@ -85,6 +110,7 @@ module dregg_lending_async::async_lending {
     /// test instead of one #[expected_failure] test per point.
     public fun pubkey_is_acceptable(pk: &vector<u8>): bool {
         if (vector::length(pk) != 32) { return false };
+        if (!is_canonical_y(pk)) { return false }; // covers all 4 non-canonical low-order forms
         let low_order = vector[
             x"0100000000000000000000000000000000000000000000000000000000000000", // order 1
             x"ECFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF7F", // order 2
@@ -94,8 +120,8 @@ module dregg_lending_async::async_lending {
             x"C7176A703D4DD84FBA3C0B760D10670F2A2053FA2C39CCC64EC7FD7792AC03FA", // order 8
             x"26E8958FC2B227B045C3F489F2EF98F0D5DFAC05D3C63339B13802886D53FC05", // order 8
             x"C7176A703D4DD84FBA3C0B760D10670F2A2053FA2C39CCC64EC7FD7792AC037A", // order 8
-            x"ECFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", // non-canonical y=0
-            x"0100000000000000000000000000000000000000000000000000000000000080", // non-canonical identity
+            x"ECFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", // order 2, sign set
+            x"0100000000000000000000000000000000000000000000000000000000000080", // order 1, sign set
         ];
         let mut i = 0;
         while (i < vector::length(&low_order)) {
@@ -116,7 +142,7 @@ module dregg_lending_async::async_lending {
     }
 
     /// Emitted when a loan opens — lets indexers/SDK discover shared Positions by borrower.
-    public struct LoanOpened has copy, drop { position: ID, borrower: address, principal: u64 }
+    public struct LoanOpened has copy, drop { position: ID, pool: ID, borrower: address, principal: u64 }
 
     /// Emitted when governance retunes the interest curve (audit trail for rate changes).
     public struct CurveUpdated has copy, drop { pool: ID, base_bps: u64, slope1_bps: u64, slope2_bps: u64, kink_bps: u64, reserve_bps: u64 }
@@ -382,7 +408,7 @@ module dregg_lending_async::async_lending {
             index_snapshot: pool.borrow_index,
             batch_id: pool.current_batch,
         };
-        event::emit(LoanOpened { position: object::id(&pos), borrower, principal: debt });
+        event::emit(LoanOpened { position: object::id(&pos), pool: object::id(pool), borrower, principal: debt });
         let loan = coin::take(&mut pool.liquidity, debt, ctx);
         (loan, pos)
     }
@@ -542,6 +568,24 @@ module dregg_lending_async::async_lending {
     /// Lets the replay test seed a consumed commit without needing a valid ed25519 signature
     /// (which cannot be produced inside a Move test). The audit flagged EAttestReplay as the
     /// least-verified guard in the F2 fix — this closes that gap with a real unit test.
+    /// Force accrual state so the overflow GUARDS can be tested. They are unreachable on any
+    /// legal curve (that is the point of the bounds), so without these the guards were dead code
+    /// as far as the suite was concerned — reverting each one left every test green.
+    #[test_only]
+    public fun set_accrual_state_for_testing<Stable>(
+        pool: &mut Pool<Stable>, borrow_index: u256, total_borrows: u64, last_accrual_s: u64,
+    ) {
+        pool.borrow_index = borrow_index;
+        pool.total_borrows = total_borrows;
+        pool.last_accrual_s = last_accrual_s;
+    }
+
+    #[test_only]
+    public fun accrue_for_testing<Stable>(pool: &mut Pool<Stable>, now: u64) { accrue(pool, now) }
+
+    #[test_only]
+    public fun borrow_index_of<Stable>(pool: &Pool<Stable>): u256 { pool.borrow_index }
+
     #[test_only]
     public fun mark_commit_used_for_testing<Stable>(pool: &mut Pool<Stable>, loan_commit: u256) {
         table::add(&mut pool.used_commits, loan_commit, true);
@@ -639,4 +683,7 @@ module dregg_lending_async::async_lending {
         if (table::contains(&p.shares, who)) { *table::borrow(&p.shares, who) } else { 0 }
     }
     public fun position_principal<C, S>(p: &Position<C, S>): u64 { p.principal }
+
+    /// Which pool this position belongs to — repay/liquidate abort with EWrongPool against any other.
+    public fun position_pool_id<C, S>(p: &Position<C, S>): ID { p.pool_id }
 }

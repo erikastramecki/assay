@@ -3,6 +3,29 @@
 # (audit F2.3) and a module-load throw 500s every route including /health, so both deploy paths
 # must set them — from the WEB build config, so the app and operator can never disagree on the pool.
 # Usage: source this, then `provision_operator_env <web-dir> <operator-vercel-dir>`
+
+# Shared build constants — these were byte-identical copies in deploy.sh and deploy-markets.sh.
+ESM_BANNER="import { createRequire as __cr } from 'module'; import { fileURLToPath as __fp } from 'url'; import { dirname as __dn } from 'path'; const require = __cr(import.meta.url); const __filename = __fp(import.meta.url); const __dirname = __dn(__filename);"
+SPA_REWRITE='{ "rewrites": [{ "source": "/((?!assets/|favicon).*)", "destination": "/index.html" }] }'
+
+# Bundle the operator with esbuild. The committed api/index.mjs is a build artifact (gitignored),
+# so every deploy path MUST run this or it ships nothing.
+bundle_operator() { # bundle_operator <operator-api-dir>
+  ( cd "$1" && ./node_modules/.bin/esbuild server-sui.mjs --bundle --platform=node --format=esm \
+      --target=node20 --outfile=assay-operator/api/index.mjs --log-level=error \
+      --banner:js="$ESM_BANNER" ) || { echo "❌ operator bundle failed"; return 1; }
+}
+
+# Deploy a directory to Vercel prod and alias it. Fails on an empty URL or a failed alias — an
+# unaliased deploy leaves the alias pointing at the PREVIOUS build, which the smoke check then
+# happily validates.
+deploy_and_alias() { # deploy_and_alias <dir> <url-grep> <alias>
+  local url
+  url=$( cd "$1" && vercel deploy --prod --yes 2>/dev/null | grep -oE "$2" | tail -1 )
+  [ -z "$url" ] && { echo "❌ deploy of $1 produced no URL"; return 1; }
+  ( cd "$1" && vercel alias set "$url" "$3" >/dev/null 2>&1 ) || { echo "❌ alias set failed for $3"; return 1; }
+  echo "   → https://$3"
+}
 provision_operator_env() {
   local webdir="$1" opvdir="$2"
   local pool stable
