@@ -72,30 +72,47 @@ module dregg_lending_async::async_lending {
     /// drops out of the equation and ANY signature verifies for ANY message. The all-zero key is
     /// the canonical case and is easy to install by accident (unset env var, truncated paste, an
     /// HSM returning null). A wrong-length key at least fails closed; a low-order key fails OPEN.
-    /// The eight low-order points of Curve25519 in compressed form:
+    /// The 8 canonical low-order points (orders 1,2,4,4,8,8,8,8), derived from the curve equation
+    /// rather than recalled — an earlier revision of this list substituted two non-canonical
+    /// encodings for two genuine order-8 points, leaving both forgeable keys accepted. The last
+    /// two entries are non-canonical encodings of low-order points (y=0 written as p, and the
+    /// identity with the sign bit set), rejected too since a decoder may normalize them.
     fun assert_valid_pubkey(pk: &vector<u8>) {
-        assert!(vector::length(pk) == 32, EBadPubkey);
+        assert!(pubkey_is_acceptable(pk), EBadPubkey);
+    }
+
+    /// Predicate form of `assert_valid_pubkey`, so the full rejection set can be asserted in one
+    /// test instead of one #[expected_failure] test per point.
+    public fun pubkey_is_acceptable(pk: &vector<u8>): bool {
+        if (vector::length(pk) != 32) { return false };
         let low_order = vector[
-            x"0000000000000000000000000000000000000000000000000000000000000000",
-            x"0100000000000000000000000000000000000000000000000000000000000000",
-            x"ECFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF7F",
-            x"0000000000000000000000000000000000000000000000000000000000000080",
-            x"0100000000000000000000000000000000000000000000000000000000000080",
-            x"26E8958FC2B227B045C3F489F2EF98F0D5DFAC05D3C63339B13802886D53FC05",
-            x"C7176A703D4DD84FBA3C0B760D10670F2A2053FA2C39CCC64EC7FD7792AC037A",
-            x"ECFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+            x"0100000000000000000000000000000000000000000000000000000000000000", // order 1
+            x"ECFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF7F", // order 2
+            x"0000000000000000000000000000000000000000000000000000000000000000", // order 4
+            x"0000000000000000000000000000000000000000000000000000000000000080", // order 4
+            x"26E8958FC2B227B045C3F489F2EF98F0D5DFAC05D3C63339B13802886D53FC85", // order 8
+            x"C7176A703D4DD84FBA3C0B760D10670F2A2053FA2C39CCC64EC7FD7792AC03FA", // order 8
+            x"26E8958FC2B227B045C3F489F2EF98F0D5DFAC05D3C63339B13802886D53FC05", // order 8
+            x"C7176A703D4DD84FBA3C0B760D10670F2A2053FA2C39CCC64EC7FD7792AC037A", // order 8
+            x"ECFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", // non-canonical y=0
+            x"0100000000000000000000000000000000000000000000000000000000000080", // non-canonical identity
         ];
         let mut i = 0;
         while (i < vector::length(&low_order)) {
-            assert!(pk != vector::borrow(&low_order, i), EBadPubkey);
+            if (pk == vector::borrow(&low_order, i)) { return false };
             i = i + 1;
         };
+        true
     }
 
     /// Curve legs must be bounded or `accrue` can abort forever (audit R2-2).
     fun assert_valid_curve(base_bps: u64, slope1_bps: u64, slope2_bps: u64, kink_bps: u64, reserve_bps: u64) {
         assert!(kink_bps > 0 && kink_bps < BPS_U64 && reserve_bps <= BPS_U64, EBadKink);
+        // Bound the SUM, not each leg: borrow_rate_bps returns base + slope1·U/kink (+ slope2
+        // above the kink), so three legs each at the per-leg ceiling give 3x that rate. An earlier
+        // revision bounded only the legs and justified the constant from the per-leg number.
         assert!(base_bps <= MAX_RATE_BPS && slope1_bps <= MAX_RATE_BPS && slope2_bps <= MAX_RATE_BPS, EBadCurve);
+        assert!(base_bps + slope1_bps + slope2_bps <= MAX_RATE_BPS, EBadCurve);
     }
 
     /// Emitted when a loan opens — lets indexers/SDK discover shared Positions by borrower.
@@ -144,6 +161,11 @@ module dregg_lending_async::async_lending {
     /// A PENDING loan: collateral locked, principal + borrow-index snapshot recorded.
     public struct Position<phantom Collateral, phantom Stable> has key {
         id: UID,
+        // SECURITY (audit R3): the pool this position was opened against. Without it, `repay` and
+        // `liquidate` accept ANY Pool<Stable> — so a position from a rich pool can be settled
+        // against a pool the attacker controls, or collateral released from the wrong ledger.
+        // Same missing-binding class as the OperatorCap fix, one level down.
+        pool_id: ID,
         borrower: address,
         collateral: Balance<Collateral>,
         principal: u64,
@@ -181,7 +203,14 @@ module dregg_lending_async::async_lending {
             let dt = ((now - last) as u256);
             let denom = BPS * SECS_PER_YEAR;
             let num = denom + (rate as u256) * dt;
-            pool.borrow_index = pool.borrow_index * num / denom;
+            // Guard the index multiply. borrow_index is monotonic and never rebased, so at a
+            // sustained max-legal rate it would overflow u256 in a few years and abort — bricking
+            // every entrypoint permanently, exactly like the downcast did. Stop compounding
+            // instead: interest ceases to accrue, but repay/withdraw keep working.
+            let max_u256 = 115792089237316195423570985008687907853269984665640564039457584007913129639935u256;
+            if (pool.borrow_index <= max_u256 / num) {
+                pool.borrow_index = pool.borrow_index * num / denom;
+            };
             let tb_old = pool.total_borrows;
             // SATURATE, don't abort (audit R2-2). Move's u256->u64 cast ABORTS on overflow, and
             // every state-changing entrypoint calls accrue first — so an overflowing accrual would
@@ -346,6 +375,7 @@ module dregg_lending_async::async_lending {
 
         let pos = Position<Collateral, Stable> {
             id: object::new(ctx),
+            pool_id: object::id(pool),
             borrower,
             collateral: coin::into_balance(collateral),
             principal: debt,
@@ -454,10 +484,30 @@ module dregg_lending_async::async_lending {
         );
         assert!(sui::ed25519::ed25519_verify(&attestation, &pool.operator_pubkey, &msg), EBadAttest);
 
+        attested_disburse_body<Collateral, Stable>(pool, collateral, debt, borrower, loan_commit, clock, ctx);
+    }
+
+    /// Everything the attested path does AFTER the signature verifies: consume the nullifier, then
+    /// disburse. Factored out so a test can exercise the REAL code — a valid ed25519 signature
+    /// cannot be produced inside a Move test, so without this the nullifier WRITE was untestable
+    /// (deleting it left the whole suite green). Shared body, so the tested path cannot drift.
+    fun attested_disburse_body<Collateral, Stable>(
+        pool: &mut Pool<Stable>, collateral: Coin<Collateral>, debt: u64, borrower: address,
+        loan_commit: u256, clock: &Clock, ctx: &mut TxContext,
+    ) {
+        assert!(!table::contains(&pool.used_commits, loan_commit), EAttestReplay);
         table::add(&mut pool.used_commits, loan_commit, true);
         let (loan, pos) = disburse_inner<Collateral, Stable>(pool, collateral, debt, borrower, loan_commit, clock, ctx);
         transfer::public_transfer(loan, borrower);
         transfer::share_object(pos);
+    }
+
+    #[test_only]
+    public fun attested_disburse_body_for_testing<Collateral, Stable>(
+        pool: &mut Pool<Stable>, collateral: Coin<Collateral>, debt: u64, borrower: address,
+        loan_commit: u256, clock: &Clock, ctx: &mut TxContext,
+    ) {
+        attested_disburse_body<Collateral, Stable>(pool, collateral, debt, borrower, loan_commit, clock, ctx)
     }
 
     /// GOVERNANCE (OperatorCap-gated): rotate the pinned operator pubkey. Rotating invalidates
@@ -508,7 +558,11 @@ module dregg_lending_async::async_lending {
 
     /// Current debt = principal · index_now / index_at_borrow (after accrual).
     fun debt_now<Collateral, Stable>(pool: &Pool<Stable>, pos: &Position<Collateral, Stable>): u64 {
-        (((pos.principal as u256) * pool.borrow_index / pos.index_snapshot) as u64)
+        // Saturate rather than abort: an aborting cast here traps the borrower's collateral
+        // permanently, since repay and liquidate are the only ways out and both call this.
+        let scaled = (pos.principal as u256) * pool.borrow_index / pos.index_snapshot;
+        let max_u64 = 18_446_744_073_709_551_615u256;
+        if (scaled > max_u64) { 18_446_744_073_709_551_615 } else { (scaled as u64) }
     }
 
     /// Release a closed loan's principal from its collateral's isolation bucket.
@@ -526,6 +580,7 @@ module dregg_lending_async::async_lending {
     public fun repay<Collateral, Stable>(
         pool: &mut Pool<Stable>, pos: Position<Collateral, Stable>, payment: Coin<Stable>, clock: &Clock, ctx: &mut TxContext,
     ): Coin<Collateral> {
+        assert!(pos.pool_id == object::id(pool), EWrongPool); // audit R3: position belongs to THIS pool
         assert!(pos.borrower == ctx.sender(), ENotBorrower);
         accrue(pool, now_s(clock));
         let owed = debt_now(pool, &pos);
@@ -533,7 +588,7 @@ module dregg_lending_async::async_lending {
         pool.total_borrows = if (pool.total_borrows > owed) { pool.total_borrows - owed } else { 0 };
         release_exposure<Collateral, Stable>(pool, pos.principal);
         balance::join(&mut pool.liquidity, coin::into_balance(payment));
-        let Position { id, borrower: _, collateral, principal: _, index_snapshot: _, batch_id: _ } = pos;
+        let Position { id, pool_id: _, borrower: _, collateral, principal: _, index_snapshot: _, batch_id: _ } = pos;
         object::delete(id);
         coin::from_balance(collateral, ctx)
     }
@@ -547,13 +602,14 @@ module dregg_lending_async::async_lending {
         pool: &mut Pool<Stable>, pos: Position<Collateral, Stable>, payment: Coin<Stable>, clock: &Clock, ctx: &mut TxContext,
     ): Coin<Collateral> {
         assert_cap(cap, pool);
+        assert!(pos.pool_id == object::id(pool), EWrongPool); // audit R3: position belongs to THIS pool
         accrue(pool, now_s(clock));
         let owed = debt_now(pool, &pos);
         assert!(coin::value(&payment) == owed, EWrongRepay);
         pool.total_borrows = if (pool.total_borrows > owed) { pool.total_borrows - owed } else { 0 };
         release_exposure<Collateral, Stable>(pool, pos.principal);
         balance::join(&mut pool.liquidity, coin::into_balance(payment));
-        let Position { id, borrower: _, collateral, principal: _, index_snapshot: _, batch_id: _ } = pos;
+        let Position { id, pool_id: _, borrower: _, collateral, principal: _, index_snapshot: _, batch_id: _ } = pos;
         object::delete(id);
         coin::from_balance(collateral, ctx)
     }

@@ -267,7 +267,7 @@ module dregg_lending_async::async_lending_tests {
     /// The expected bytes below were emitted by `app/sui-sdk/src/attest.ts::attestationMessage`
     /// for these exact inputs. If this test fails, the two layouts have drifted apart — fix the
     /// mismatch, do NOT re-baseline this constant to whatever Move currently produces.
-    // ---- audit R2 regressions -------------------------------------------------------------
+    // ---- audit R2/R3 regressions -------------------------------------------------------------
 
     #[test]
     #[expected_failure(abort_code = al::EAttestReplay)]
@@ -345,6 +345,113 @@ module dregg_lending_async::async_lending_tests {
             60,                             // expiry_s
         );
         assert!(actual == expected, 0);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = al::EWrongPool)]
+    fun repay_rejects_position_from_another_pool() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool_a, cap_a, clk) = attest_fixture(0, &mut ctx);
+        let (mut pool_b, cap_b) = al::new_pool<USDC>(0, 0, 0, 8000, 0, 1_000_000_000_000, 0, vk(), opk(), &clk, &mut ctx);
+        al::deposit(&mut pool_b, coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), &clk, &mut ctx);
+        // open the loan against pool B...
+        let (loan, pos) = al::disburse<SSPX, USDC>(&cap_b, &mut pool_b,
+            coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx), 500_000_000, ctx.sender(), 1u256, &clk, &mut ctx);
+        // ...then settle it against pool A. Must abort: the position belongs to B's ledger.
+        let coll = al::repay<SSPX, USDC>(&mut pool_a, pos, coin::mint_for_testing<USDC>(500_000_000, &mut ctx), &clk, &mut ctx);
+        // unreachable
+        coin::burn_for_testing(loan); coin::burn_for_testing(coll);
+        clock::destroy_for_testing(clk);
+        test_utils::destroy(pool_a); test_utils::destroy(cap_a);
+        test_utils::destroy(pool_b); test_utils::destroy(cap_b);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = al::EWrongPool)]
+    fun liquidate_rejects_position_from_another_pool() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool_a, cap_a, clk) = attest_fixture(0, &mut ctx);
+        let (mut pool_b, cap_b) = al::new_pool<USDC>(0, 0, 0, 8000, 0, 1_000_000_000_000, 0, vk(), opk(), &clk, &mut ctx);
+        al::deposit(&mut pool_b, coin::mint_for_testing<USDC>(1_000_000_000, &mut ctx), &clk, &mut ctx);
+        let (loan, pos) = al::disburse<SSPX, USDC>(&cap_b, &mut pool_b,
+            coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx), 500_000_000, ctx.sender(), 1u256, &clk, &mut ctx);
+        // pool A's own cap passes assert_cap, so only the position binding stops this
+        let coll = al::liquidate<SSPX, USDC>(&cap_a, &mut pool_a, pos, coin::mint_for_testing<USDC>(500_000_000, &mut ctx), &clk, &mut ctx);
+        // unreachable
+        coin::burn_for_testing(loan); coin::burn_for_testing(coll);
+        clock::destroy_for_testing(clk);
+        test_utils::destroy(pool_a); test_utils::destroy(cap_a);
+        test_utils::destroy(pool_b); test_utils::destroy(cap_b);
+    }
+
+    /// Exercises the REAL attested-path body (post-signature), so the nullifier WRITE is covered:
+    /// deleting `table::add` from `attested_disburse_body` fails this test. Verified by mutation.
+    #[test]
+    fun attested_disburse_records_the_commit_as_spent() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        assert!(!al::commit_used(&pool, 7u256), 0);
+        al::attested_disburse_body_for_testing<SSPX, USDC>(
+            &mut pool, coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx),
+            100_000_000, ctx.sender(), 7u256, &clk, &mut ctx);
+        assert!(al::commit_used(&pool, 7u256), 1); // the nullifier must be burned
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = al::EAttestReplay)]
+    fun attested_disburse_body_rejects_a_spent_commit() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        al::attested_disburse_body_for_testing<SSPX, USDC>(
+            &mut pool, coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx),
+            100_000_000, ctx.sender(), 7u256, &clk, &mut ctx);
+        // same commit again — the second disbursement must abort
+        al::attested_disburse_body_for_testing<SSPX, USDC>(
+            &mut pool, coin::mint_for_testing<SSPX>(100_000_000_000, &mut ctx),
+            100_000_000, ctx.sender(), 7u256, &clk, &mut ctx);
+        // unreachable
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = al::EBadCurve)]
+    fun rate_curve_rejects_legs_that_sum_over_ceiling() {
+        let mut ctx = tx_context::dummy();
+        let (mut pool, cap, clk) = attest_fixture(0, &mut ctx);
+        // each leg is individually under MAX_RATE_BPS, but borrow_rate_bps SUMS them
+        al::set_rate_curve(&cap, &mut pool, 90_000, 90_000, 90_000, 8000, 0, &clk, &mut ctx);
+        // unreachable
+        clock::destroy_for_testing(clk); test_utils::destroy(pool); test_utils::destroy(cap);
+    }
+
+    #[test]
+    fun new_pool_rejects_every_low_order_pubkey() {
+        let mut ctx = tx_context::dummy();
+        let clk = clock::create_for_testing(&mut ctx);
+        // all 8 canonical low-order points + 2 non-canonical encodings must be rejected.
+        // An earlier revision substituted junk for two genuine order-8 points, leaving both
+        // forgeable keys accepted — this asserts the whole set, derived not recalled.
+        let keys = vector[
+            x"0100000000000000000000000000000000000000000000000000000000000000",
+            x"ECFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF7F",
+            x"0000000000000000000000000000000000000000000000000000000000000000",
+            x"0000000000000000000000000000000000000000000000000000000000000080",
+            x"26E8958FC2B227B045C3F489F2EF98F0D5DFAC05D3C63339B13802886D53FC85",
+            x"C7176A703D4DD84FBA3C0B760D10670F2A2053FA2C39CCC64EC7FD7792AC03FA",
+            x"26E8958FC2B227B045C3F489F2EF98F0D5DFAC05D3C63339B13802886D53FC05",
+            x"C7176A703D4DD84FBA3C0B760D10670F2A2053FA2C39CCC64EC7FD7792AC037A",
+            x"ECFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+            x"0100000000000000000000000000000000000000000000000000000000000080",
+        ];
+        let mut i = 0;
+        while (i < vector::length(&keys)) {
+            assert!(!al::pubkey_is_acceptable(vector::borrow(&keys, i)), i);
+            i = i + 1;
+        };
+        // a real key is still accepted
+        assert!(al::pubkey_is_acceptable(&opk()), 99);
+        clock::destroy_for_testing(clk);
     }
 
     #[test]
