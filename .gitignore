@@ -20,3 +20,10 @@ src/docs.generated.ts
 # Move ephemeral publication metadata (self-labeled "do not commit")
 **/Pub.*.toml
 .DS_Store
+
+# --- foundry (rh-chain) ---
+# Dependencies are reproduced by `forge install`, not vendored — see rh-chain/README.md
+lib/
+out/
+cache/
+broadcast/
