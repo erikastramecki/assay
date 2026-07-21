@@ -272,8 +272,28 @@ token in wallet.
 
 **Still open:**
 
-1. **Feed heartbeats and deviation thresholds** per Stock Token — sets the staleness bound and
-   therefore the safe LTV. Read from Chainlink's Robinhood feeds page, do not hardcode.
+1. ~~Feed heartbeats and deviation thresholds~~ **RESOLVED.** All 34 Robinhood equity feeds (and
+   the crypto feeds) are **86400s heartbeat / 0.5% deviation**, from Chainlink's feed directory.
+   This corrected a real bug: the first `StaleFeedGuard` draft used bounds TIGHTER than the
+   heartbeat and would have rejected healthy prices constantly — the live AAPL feed read $326.49
+   at ~2.4h old, which my own guard would have refused. Regenerate with
+   `node rh-chain/script/fetch-feeds.mjs`, which exits non-zero if the heartbeat ever changes.
+
+2. 🚩 **BLOCKER — the L2 sequencer uptime feed cannot be found.** Robinhood's docs say
+   *"Chainlink provides an L2 Sequencer Uptime Feed for this; check it before reading any price."*
+   It is not on Chainlink's canonical L2 sequencer feed list, not in the Robinhood feed directory,
+   not findable by name search, and every contract from Chainlink's deployer on this chain
+   resolves to a price feed. Their docs have already been wrong once about this chain, so the
+   claim alone is not evidence.
+
+   Without it: during an outage nothing executes and nothing can be liquidated; on resumption a
+   backlog runs against prices users had no chance to react to. The 24h heartbeat means staleness
+   detection would not notice an outage for a full day — far too slow to substitute.
+
+   `StaleFeedGuard` accepts `address(0)` and exposes `sequencerCheckDisabled()` so the gap is
+   advertised rather than silently skipped. **Resolve before mainnet**: either locate the feed
+   (ask `chain-developers-group@robinhood.com`) or accept it explicitly with the LTV buffer and an
+   off-chain pause keeper as the compensating controls.
 2. **Has `adminBurn` ever been used?** Check historical `Transfer`-to-zero events from admin roles.
    Frequency changes whether this is theoretical or operational.
 3. ~~Who holds `ADMIN_BURNER_ROLE`?~~ **RESOLVED — and it is the worst of the plausible answers.**

@@ -70,17 +70,47 @@ contract StaleFeedGuard {
     /// for a grace period rather than liquidating people on a resumed-but-unwound market.
     uint256 public constant SEQUENCER_GRACE_PERIOD = 3600;
 
+    /// The L2 sequencer uptime feed, or address(0) if none exists on this chain.
+    ///
+    /// UNRESOLVED AS OF DEPLOYMENT (2026-07-20). Robinhood's docs state that "Chainlink provides
+    /// an L2 Sequencer Uptime Feed for this; check it before reading any price." That feed could
+    /// not be found: Robinhood Chain is absent from Chainlink's canonical L2 sequencer feed list,
+    /// absent from the Robinhood feed directory (55 entries, all price feeds), returns nothing on
+    /// a name search, and every contract deployed by Chainlink's deployer on this chain resolves
+    /// to a price feed. Their docs have already been wrong once on this chain (they described
+    /// transfer restrictions the deployed token does not have), so the doc claim alone is not
+    /// evidence.
+    ///
+    /// Setting this to address(0) SKIPS the check and accepts a real, named risk: during a
+    /// sequencer outage no transaction executes, so nothing can be liquidated; on resumption a
+    /// backlog runs against prices users had no chance to react to. The 24h heartbeat means
+    /// staleness detection would not catch an outage for a full day, which is far too slow to
+    /// substitute.
+    ///
+    /// Compensating controls REQUIRED when this is address(0):
+    ///   - the LTV/liquidation buffer must absorb an outage-length gap (this is a second reason
+    ///     the buffer is 20pp, not a thin one)
+    ///   - an off-chain keeper must pause the pool on detected outage
+    /// Revisit before mainnet: if a real uptime feed appears, deploy with it set.
     AggregatorV3Interface public immutable sequencerUptimeFeed;
+
+    /// True when this deployment has no sequencer uptime feed and is running on compensating
+    /// controls instead. Exposed so the UI and any monitoring can surface it rather than assume.
+    bool public immutable sequencerCheckDisabled;
     mapping(address => FeedConfig) internal _feeds;
 
     constructor(AggregatorV3Interface sequencerUptimeFeed_) {
         sequencerUptimeFeed = sequencerUptimeFeed_;
+        sequencerCheckDisabled = address(sequencerUptimeFeed_) == address(0);
     }
 
     /// Reverts unless the L2 sequencer is up and has been up for the full grace period.
     /// Standard Arbitrum-stack requirement. It has no analogue in the Sui design because Sui has
     /// no sequencer — this is a category of failure that only exists on an L2.
     function _requireSequencerUp() internal view {
+        // No feed on this chain — see the note on `sequencerUptimeFeed`. Deliberately explicit
+        // rather than a silent no-op, so this cannot be mistaken for a passing check.
+        if (sequencerCheckDisabled) return;
         (, int256 answer, uint256 startedAt,,) = sequencerUptimeFeed.latestRoundData();
         // 0 = up, 1 = down
         if (answer != 0) revert SequencerDown();

@@ -163,6 +163,18 @@ contract StaleFeedGuardTest is Test {
         g.priceOf(address(0xBB));
     }
 
+    /// A deployment with no uptime feed must still work, and must SAY so — the risk is real and
+    /// carried by compensating controls, so it has to be visible rather than silently skipped.
+    function test_missingSequencerFeedIsExplicitNotSilent() public {
+        GuardHarness g2 = new GuardHarness(AggregatorV3Interface(address(0)));
+        g2.setFeed(TOK, px, 90_000, 8);
+        assertTrue(g2.sequencerCheckDisabled(), "must advertise that the check is off");
+        (uint256 p,,) = g2.priceOf(TOK); // still functions
+        assertEq(p, 200e8);
+        // and the configured deployment must NOT claim the check is disabled
+        assertFalse(g.sequencerCheckDisabled());
+    }
+
     function test_marketHoursBoundaries() public view {
         uint256 day = (MON_IN_SESSION / 86400) * 86400;
         assertFalse(g.isUsMarketHours(day + 14 hours + 29 minutes)); // 09:29 ET
