@@ -529,7 +529,7 @@ function DocsSection() {
             <div className="doc-reader" key={open.slug} tabIndex={-1} data-autofocus
                  role="dialog" aria-modal="true" aria-label={open.title} onClick={(e) => e.stopPropagation()}>
               <div className="doc-reader-h"><span>{open.title}</span><button onClick={() => setOpen(null)} aria-label="close">×</button></div>
-              <div className="doc-md" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(marked.parse(open.md) as string) }} />
+              <div className="doc-md" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(marked.parse(open.md) as string, { FORBID_TAGS: ["form", "input", "button", "textarea"] }) }} />
             </div>
           </div>
         </Overlay>
