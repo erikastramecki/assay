@@ -100,8 +100,8 @@ Run under a supervisor and alert on the WARN/ALERT lines: a silently dead keeper
   the one thing protecting lenders. Parameter changes are timelocked 2 days and re-validated at
   commit; disabling a market is immediate, because turning lending off is always safe.
 - `LivenessOracle` — heartbeat-based chain-liveness gate; fail-closed, no race on restart.
-- `StaleFeedGuard` — sequencer uptime + grace period, per-feed staleness with a tighter off-hours
-  bound, session reporting. Fails closed. A revert is the right answer to an unknown price.
+- `StaleFeedGuard` — sequencer uptime + grace period, a single per-feed staleness bound sized to the 86400s heartbeat
+  (an earlier draft had a tighter off-hours bound; it was wrong and was removed), session reporting. Fails closed. A revert is the right answer to an unknown price.
 - `CollateralReconciler` — never trusts a stored balance; detects `adminBurn` shortfall without
   reverting (reverting would freeze every other borrower); values via the live `uiMultiplier` so a
   stock split cannot misprice positions.

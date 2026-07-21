@@ -106,13 +106,23 @@ liquidations resumed in the first block back — the exact restart-liquidation t
 prevent, at a smaller scale. **Fix:** a separate, tighter `gapThreshold`, validated to be below the
 liveness bound.
 
-### MEDIUM — surviving guard mutations (fixed)
-A systematic sweep — deleting every single-line guard in all five contracts, one at a time — found
-**13 deletable with a green suite**. Twelve now fail their mutation. Two of those were not missing
-tests at all but **bare `expectRevert()` calls**, which match any revert including the one that
-would happen anyway; they passed with the guard deleted. One guard was genuinely unreachable and
-was removed rather than papered over. The single remaining survivor is a deliberately redundant
-fail-fast check, documented as such in the source.
+### MEDIUM — surviving guard mutations (PARTIALLY fixed; the claim made here was wrong)
+A sweep found 13 guards deletable with a green suite, and twelve were given tests. Two of those
+were not missing tests but **bare `expectRevert()` calls**, which match any revert including the
+one that would happen anyway.
+
+**Round 2 disproved the coverage claim by a factor of 50.** An independent sweep of 139 mutations
+— deletions, comparison inversions, operand swaps and constant changes across all seven source
+files — found **50 survivors** on the same green suite.
+
+The cause was a bug in the measurement tool, not merely its narrowness: the sweep matched only
+`if (…) revert` and `require(…)`, so it was structurally blind to the **early-return** guard form
+(`if (x == 0) return 0;`), which is used throughout. Two survivors fall inside the sweep's own
+stated scope. **A claim about coverage was published on the output of a tool that had never been
+tested.**
+
+Corrected status: 12 guards gained tests; roughly 50 mutations survive; the constants the README
+names as the controls (`MIN_RISK_GAP_BPS`, `PARAM_TIMELOCK`) can be halved with the suite green.
 
 ---
 

@@ -45,8 +45,19 @@ upgrade in place. Needs a fresh package, a fresh pool, and a new `VITE_POOL`.
 
 | Severity | Item |
 |---|---|
-| — | All four round-1 mediums are fixed (DST, market holidays, short outages, surviving mutations). See the [round-1 report](audits/solidity-round-1.md). |
-| — | **A clean audit round has not yet been run against these fixes.** Fixing findings does not clear the gate; only a round where all three auditors return clean does. |
+| critical | A watched token returning a non-boolean `paused()` word makes `abi.decode` panic inside `accrue()`, freezing **every** entry point — including liquidation — until a single admin EOA resets the array. |
+| high | Pro-rata collateral is correct on CLOSE but wrong on OPEN: the denominator is live, so anyone who borrows **after** a burn is charged for it. |
+| high | The decimals fix moved the trust into two operator-typed fields that nothing cross-checks against the token's real `decimals()`. A one-character typo reproduces the original 1e12 drain. |
+| high | `accrue()` runs **after** OZ computes the share price in all four ERC4626 paths, so pending interest is extractable — and flash-loanable. |
+| medium | Pause suspends interest **pool-wide** and forgives it permanently, so an unrelated token's pause hands every borrower a free loan. |
+| medium | DST intersection does not handle the ~3 half-day early closes per year. |
+| medium | The holiday guard false-rejects on EDT days whose only print lands in the 13:30–14:30 opening hour — and because `canLiquidate` shares the flag, that is a liquidation outage. |
+| medium | `resumeGrace` at 6× `gapThreshold` turns routine keeper jitter into a permanent liquidation DoS. |
+| medium | ~50 mutations survive a green suite, including `MIN_RISK_GAP_BPS` and `PARAM_TIMELOCK`. |
+
+**Round 2 was not clean.** This is the fourth consecutive round in which a shipped fix either did
+not work or introduced a new defect, and the third in which a claim I made in a commit message or
+document was disproven by the next round.
 
 Nothing in `rh-chain/` is deployed to any network.
 
