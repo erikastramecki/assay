@@ -60,8 +60,38 @@ This shaped the design, and corrected a mistake:
 `_setFeed` rejects any `maxStaleness` below the heartbeat, so this class of misconfiguration
 cannot be deployed.
 
+## Chain liveness (standing in for the missing sequencer feed)
+
+Robinhood Chain has no locatable Chainlink L2 Sequencer Uptime Feed (see the scope doc). Without
+one, the danger is not the outage itself — during a halt nothing executes at all — it is the
+RESTART: a backlog runs at once, liquidation bots are fastest, and a borrower who was healthy when
+the chain died gets liquidated in the first block back with no chance to react.
+
+**A "pause on outage" keeper cannot work.** It would have to send its pause transaction to a chain
+that is down. It could only act after restart, racing the same backlog as the liquidators, and it
+would lose. A safety control that loses a race is not a safety control.
+
+`LivenessOracle` inverts it. The keeper posts a **heartbeat** on a schedule; liquidations require a
+recent one. If the chain halts, the keeper cannot post, so on restart liquidations are **already**
+disabled — no transaction needed at the critical moment, and nothing to front-run. The first
+heartbeat after a gap starts a grace period rather than reopening, so borrowers get a window to
+repay or top up. Repay and top-up are never gated on liveness: during a recovery those are exactly
+the actions a borrower needs, and blocking them would make the control cause the liquidation it
+exists to prevent.
+
+Keeper failure, RPC failure and chain failure are all the same event here — the heartbeat stopped —
+and all fail closed.
+
+```
+RH_RPC=... KEEPER_PRIVKEY=0x... LIVENESS_ORACLE=0x... node keeper/liveness-keeper.mjs
+```
+
+Run under a supervisor and alert on the WARN/ALERT lines: a silently dead keeper degrades to
+"liquidations off", which is safe but is an outage of its own.
+
 ## Modules
 
+- `LivenessOracle` — heartbeat-based chain-liveness gate; fail-closed, no race on restart.
 - `StaleFeedGuard` — sequencer uptime + grace period, per-feed staleness with a tighter off-hours
   bound, session reporting. Fails closed. A revert is the right answer to an unknown price.
 - `CollateralReconciler` — never trusts a stored balance; detects `adminBurn` shortfall without
