@@ -27,7 +27,8 @@ contract AssayMarketsTest is Test {
     // The conservative v1 stance: 35% LTV / 55% liquidation = a 20pp gap.
     function _conservative() internal pure returns (AssayMarkets.Market memory) {
         return AssayMarkets.Market({
-            enabled: true, ltvBps: 3_500, liqThresholdBps: 5_500, liqBonusBps: 800, cap: 1_000_000e6
+            enabled: true, ltvBps: 3_500, liqThresholdBps: 5_500, liqBonusBps: 800,
+            collateralDecimals: 18, cap: 1_000_000e6
         });
     }
 
@@ -42,7 +43,7 @@ contract AssayMarketsTest is Test {
         px = new MockFeed(200e8, 8); // $200
         tok = new MockStock();
         liv = new LivenessOracle(KEEPER, GUARDIAN, MAX_AGE, GRACE);
-        mk = new AssayMarkets(AggregatorV3Interface(address(seq)), liv, ADMIN);
+        mk = new AssayMarkets(AggregatorV3Interface(address(seq)), liv, ADMIN, 6); // USDG is 6dp
 
         _enable(_conservative());
         _bringLivenessOnline();
@@ -81,30 +82,32 @@ contract AssayMarketsTest is Test {
 
     function test_collateralValueUsesTheLiveMultiplier() public {
         (uint256 v,) = mk.collateralValue(address(tok), 10e18); // 10 shares @ $200
-        assertEq(v, 2000e18);
+        // Values are in the BORROW asset (USDG, 6dp), not the collateral's 18dp.
+        // Asserting 2000e18 is what the 1e12 valuation bug looked like from the test side.
+        assertEq(v, 2000e6, "$2000 in USDG units");
         tok.setMultiplier(4e18); // 4:1 split
         px.set(50e8, block.timestamp); // price adjusts
         (uint256 v2,) = mk.collateralValue(address(tok), 10e18);
-        assertEq(v2, 2000e18, "a split must not change economic value");
+        assertEq(v2, 2000e6, "a split must not change economic value");
     }
 
     function test_maxBorrowAppliesLtv() public view {
         // 10 shares @ $200 = $2000; 35% LTV = $700
-        assertEq(mk.maxBorrow(address(tok), 10e18), 700e18);
+        assertEq(mk.maxBorrow(address(tok), 10e18), 700e6);
     }
 
     function test_underwaterUsesTheThresholdNotTheLtv() public view {
-        // $2000 collateral, 55% threshold = $1100 trigger
-        assertFalse(mk.isUnderwater(address(tok), 10e18, 1_099e18));
-        assertTrue(mk.isUnderwater(address(tok), 10e18, 1_101e18));
+        // $2000 collateral, 55% threshold = $1100 trigger (USDG units)
+        assertFalse(mk.isUnderwater(address(tok), 10e18, 1_099e6));
+        assertTrue(mk.isUnderwater(address(tok), 10e18, 1_101e6));
         // a loan at max LTV ($700) is comfortably healthy — that gap is the whole point
-        assertFalse(mk.isUnderwater(address(tok), 10e18, 700e18));
+        assertFalse(mk.isUnderwater(address(tok), 10e18, 700e6));
     }
 
     /// The gap must absorb an unliquidatable adverse move. At max LTV, how far can price fall
     /// before the position is underwater? $700 debt vs 55% of collateral value.
     function test_gapAbsorbsRoughlyA30PercentDrop() public {
-        uint256 debt = mk.maxBorrow(address(tok), 10e18); // $700
+        uint256 debt = mk.maxBorrow(address(tok), 10e18); // $700 in USDG units
         px.set(140e8, block.timestamp); // -30%: $1400 collateral
         assertFalse(mk.isUnderwater(address(tok), 10e18, debt), "must survive a 30% gap");
         px.set(125e8, block.timestamp); // -37.5%: $1250, threshold $687.50

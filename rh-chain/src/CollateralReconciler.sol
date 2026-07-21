@@ -28,57 +28,57 @@ import {IScaledUI} from "./interfaces/IScaledUI.sol";
 ///     would trap every borrower's remaining collateral; silently ignoring it would let the pool
 ///     lend against tokens that no longer exist.
 abstract contract CollateralReconciler {
-    /// Raw units this pool believes it holds for `token`, summed over open positions.
+    /// NOMINAL raw units this pool holds for `token`: the sum of open positions' posted
+    /// collateral. Deliberately NOT reduced when the issuer burns — that would destroy the
+    /// denominator the pro-rata share is computed from.
     mapping(address => uint256) public recordedRaw;
 
-    /// Raw units known to have been destroyed or otherwise lost under this pool's feet.
+    /// Cumulative raw units destroyed under this pool's feet, for reporting.
     mapping(address => uint256) public shortfallRaw;
 
     event CollateralShortfall(address indexed token, uint256 recorded, uint256 actual, uint256 shortfall);
-    event ShortfallSocialised(address indexed token, uint256 amount);
 
     error InsufficientRecorded(address token, uint256 have, uint256 want);
 
-    /// Reconcile the ledger against reality. MUST be called before any valuation or seizure.
+    /// A position's ACTUAL entitlement, pro-rata against what survives.
     ///
-    /// Returns the shortfall discovered on this call (0 in the normal case). Deliberately does not
-    /// revert on shortfall: reverting would freeze repayment for every other borrower and turn a
-    /// partial loss into a total one.
-    function _reconcile(address token) internal returns (uint256 newShortfall) {
-        uint256 recorded = recordedRaw[token];
+    /// THIS IS THE FIX FOR THE adminBurn ORDERING BUG. `recordedRaw` is per-TOKEN while positions
+    /// are per-BORROWER, so an earlier version clamped a per-borrower entitlement against the
+    /// pooled balance: Alice and Bob each post 10, Robinhood burns 10, and whoever repaid FIRST
+    /// recovered all 10 — including the other's — while the second recovered nothing. Scaling by
+    /// (surviving / nominal) socialises the loss across every holder of that token, which is the
+    /// policy this contract always claimed to implement and previously did not.
+    ///
+    /// Alice and Bob each get 5, in either order.
+    function _effectiveCollateral(address token, uint256 nominalRaw) internal view returns (uint256) {
+        uint256 nominal = recordedRaw[token];
+        if (nominal == 0) return 0;
         uint256 actual = IERC20(token).balanceOf(address(this));
-        if (actual >= recorded) return 0;
-
-        newShortfall = recorded - actual;
-        recordedRaw[token] = actual;
-        shortfallRaw[token] += newShortfall;
-        emit CollateralShortfall(token, recorded, actual, newShortfall);
+        if (actual >= nominal) return nominalRaw; // nothing lost
+        return (nominalRaw * actual) / nominal;
     }
 
-    /// Economic value of `rawAmount` units, in the price feed's units.
-    ///
-    /// Applies `uiMultiplier()` live. This is the single most important line in the file: a pool
-    /// that values raw balances is correct until the first stock split and catastrophically wrong
-    /// immediately after, in whichever direction the split went.
-    function _valueOf(address token, uint256 rawAmount, uint256 price, uint8 priceDecimals)
-        internal
-        view
-        returns (uint256)
-    {
-        uint256 uiAmount = _uiAmount(token, rawAmount);
-        return (uiAmount * price) / (10 ** priceDecimals);
+    /// Record any newly-discovered shortfall. Reporting only — it must NOT adjust `recordedRaw`,
+    /// because the nominal total is what `_effectiveCollateral` divides by.
+    function _reconcile(address token) internal returns (uint256 newShortfall) {
+        uint256 nominal = recordedRaw[token];
+        uint256 actual = IERC20(token).balanceOf(address(this));
+        if (actual >= nominal) return 0;
+        uint256 total = nominal - actual;
+        uint256 known = shortfallRaw[token];
+        if (total <= known) return 0;
+        newShortfall = total - known;
+        shortfallRaw[token] = total;
+        emit CollateralShortfall(token, nominal, actual, total);
     }
 
-    /// Raw units converted to share-equivalent units via the live corporate-action multiplier.
+    /// Economic value of `rawAmount`, priced via the live corporate-action multiplier.
     function _uiAmount(address token, uint256 rawAmount) internal view returns (uint256) {
-        IScaledUI s = IScaledUI(token);
-        uint256 mult = s.uiMultiplier();
-        // DENOMINATOR is 1e18 in Robinhood's ERC20ScaledUIUpgradeable.
-        return (rawAmount * mult) / 1e18;
+        return (rawAmount * IScaledUI(token).uiMultiplier()) / 1e18;
     }
 
-    /// Is a corporate action scheduled but not yet effective? Surfacing this lets the UI and the
-    /// keeper warn before a split silently rescales every position.
+    /// Is a corporate action scheduled but not yet effective? Lets the UI and keeper warn before
+    /// a split silently rescales every position.
     function pendingMultiplier(address token) external view returns (uint256 newMultiplier, uint256 effectiveAt) {
         try IScaledUI(token).newUIMultiplier() returns (uint256 m, uint256 at) {
             return (m, at);

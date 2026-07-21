@@ -39,6 +39,8 @@ contract MockStock is ERC20 {
     function mint(address to, uint256 amt) external { _mint(to, amt); }
     function adminBurn(address from, uint256 amt) external { _burn(from, amt); }
     function setMultiplier(uint256 m) external { uiMultiplier = m; }
+    bool public paused;
+    function setPaused(bool v) external { paused = v; }
     function schedule(uint256 m, uint256 at) external { _newMult = m; _effectiveAt = at; }
     function newUIMultiplier() external view returns (uint256, uint256) { return (_newMult, _effectiveAt); }
     function balanceOfUI(address a) external view returns (uint256) { return balanceOf(a) * uiMultiplier / 1e18; }
@@ -56,9 +58,10 @@ contract ReconcilerHarness is CollateralReconciler {
     function reconcile(address t) external returns (uint256) { return _reconcile(t); }
     function credit(address t, uint256 a) external { _creditCollateral(t, a); }
     function debit(address t, uint256 a) external { _debitCollateral(t, a); }
-    function valueOf(address t, uint256 raw, uint256 p, uint8 d) external view returns (uint256) {
-        return _valueOf(t, raw, p, d);
+    function effective(address t, uint256 raw) external view returns (uint256) {
+        return _effectiveCollateral(t, raw);
     }
+    function uiAmount(address t, uint256 raw) external view returns (uint256) { return _uiAmount(t, raw); }
 }
 
 // ---------------------------------------------------------------- tests
@@ -208,37 +211,53 @@ contract CollateralReconcilerTest is Test {
 
     function test_noShortfallWhenBalancesAgree() public {
         assertEq(r.reconcile(address(tok)), 0);
+        assertEq(r.effective(address(tok), 100e18), 100e18);
+    }
+
+    /// adminBurn is detected and RECORDED, and must not revert — reverting would freeze every
+    /// other borrower and turn a partial loss into a total one.
+    function test_adminBurnIsDetectedAndRecorded() public {
+        tok.adminBurn(address(r), 30e18);
+        assertEq(r.reconcile(address(tok)), 30e18);
+        assertEq(r.shortfallRaw(address(tok)), 30e18);
+        assertEq(r.reconcile(address(tok)), 0, "idempotent: nothing NEW the second time");
+        // the nominal total is deliberately NOT reduced — it is the pro-rata denominator
         assertEq(r.recordedRaw(address(tok)), 100e18);
     }
 
-    /// THE adminBurn CASE. Robinhood destroys collateral out of the live pool; the ledger must
-    /// notice, record the loss, and NOT revert — reverting would freeze every other borrower.
-    function test_adminBurnIsDetectedAndRecorded() public {
-        tok.adminBurn(address(r), 30e18);
-        uint256 s = r.reconcile(address(tok));
-        assertEq(s, 30e18, "shortfall must equal the burned amount");
-        assertEq(r.recordedRaw(address(tok)), 70e18, "ledger must follow reality down");
-        assertEq(r.shortfallRaw(address(tok)), 30e18);
-        // and it must be idempotent — a second reconcile finds nothing new
-        assertEq(r.reconcile(address(tok)), 0);
+    /// THE ORDERING BUG. Two borrowers, one burn: each must lose their share, in EITHER order.
+    /// Previously the pooled balance was clamped against a per-borrower figure, so whoever repaid
+    /// first recovered everything — including the other's collateral.
+    function test_burnLossIsSharedProRataNotByRepaymentOrder() public {
+        // Alice 10, Bob 10 (on top of the 100 from setUp, so isolate: use a fresh harness)
+        ReconcilerHarness r2 = new ReconcilerHarness();
+        MockStock t2 = new MockStock();
+        t2.mint(address(r2), 20e18);
+        r2.credit(address(t2), 10e18); // Alice
+        r2.credit(address(t2), 10e18); // Bob
+        t2.adminBurn(address(r2), 10e18); // Robinhood destroys half
+
+        // whoever asks first gets 5, not 10
+        assertEq(r2.effective(address(t2), 10e18), 5e18, "Alice's share");
+        // Alice exits: transfer her 5 and debit her nominal 10
+        t2.adminBurn(address(r2), 5e18); // stand-in for the outbound transfer
+        r2.debit(address(t2), 10e18);
+        // Bob's share is still 5 — he is not left with zero
+        assertEq(r2.effective(address(t2), 10e18), 5e18, "Bob's share, unharmed by Alice going first");
     }
 
-    function test_totalBurnDoesNotRevert() public {
+    function test_totalBurnLeavesEveryoneAtZeroNotSomeoneWhole() public {
         tok.adminBurn(address(r), 100e18);
         assertEq(r.reconcile(address(tok)), 100e18);
-        assertEq(r.recordedRaw(address(tok)), 0);
+        assertEq(r.effective(address(tok), 100e18), 0);
     }
 
-    /// THE CORPORATE-ACTION CASE. A 4:1 split quadruples the share-equivalent amount. Valuing the
-    /// RAW balance would understate the position by 4x and liquidate a healthy loan.
-    function test_valuationFollowsTheCorporateActionMultiplier() public {
-        uint256 before_ = r.valueOf(address(tok), 100e18, 200e8, 8);
-        assertEq(before_, 100e18 * 200); // 100 shares @ $200
-
-        tok.setMultiplier(4e18); // 4:1 split
-        uint256 after_ = r.valueOf(address(tok), 100e18, 50e8, 8); // price adjusts to $50
-        assertEq(after_, 400e18 * 50, "must value 400 share-equivalents, not 100");
-        assertEq(before_, after_, "economic value is unchanged by a split");
+    /// Valuation must follow the corporate-action multiplier: a 4:1 split quadruples the
+    /// share-equivalent, so pricing the RAW balance would understate the position 4x.
+    function test_uiAmountFollowsTheMultiplier() public {
+        assertEq(r.uiAmount(address(tok), 100e18), 100e18);
+        tok.setMultiplier(4e18);
+        assertEq(r.uiAmount(address(tok), 100e18), 400e18);
     }
 
     function test_pendingMultiplierIsVisibleBeforeItFires() public {

@@ -4,6 +4,8 @@ pragma solidity ^0.8.28;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {AssayMarkets} from "./AssayMarkets.sol";
 import {CollateralReconciler} from "./CollateralReconciler.sol";
@@ -27,7 +29,7 @@ import {CollateralReconciler} from "./CollateralReconciler.sol";
 ///   R2  rate parameters are bounded and the maths saturates rather than trapping funds.
 ///
 /// Shares are an ERC-20 so lenders can hold and transfer their claim.
-contract AssayPool is ERC20, ReentrancyGuard, CollateralReconciler {
+contract AssayPool is ERC4626, ReentrancyGuard, CollateralReconciler {
     using SafeERC20 for IERC20;
 
     error MarketClosed(address token);
@@ -59,7 +61,6 @@ contract AssayPool is ERC20, ReentrancyGuard, CollateralReconciler {
     /// the curve, so bounding the legs individually would permit 3x this (the R2-2 lesson).
     uint256 public constant MAX_RATE_BPS = 100_000; // 1000% APR
 
-    IERC20 public immutable asset; // USDG
     AssayMarkets public immutable markets;
 
     uint256 public totalBorrows;
@@ -80,9 +81,9 @@ contract AssayPool is ERC20, ReentrancyGuard, CollateralReconciler {
 
     constructor(IERC20 asset_, AssayMarkets markets_, uint256 base_, uint256 s1_, uint256 s2_, uint256 reserve_)
         ERC20("Assay Pool Share", "aUSDG")
+        ERC4626(IERC20(address(asset_)))
     {
         if (base_ + s1_ + s2_ > MAX_RATE_BPS || reserve_ > BPS) revert BadCurve();
-        asset = asset_;
         markets = markets_;
         baseBps = base_;
         slope1Bps = s1_;
@@ -94,7 +95,7 @@ contract AssayPool is ERC20, ReentrancyGuard, CollateralReconciler {
     // ---------------------------------------------------------------- accrual
 
     function utilizationBps() public view returns (uint256) {
-        uint256 cash = asset.balanceOf(address(this));
+        uint256 cash = IERC20(asset()).balanceOf(address(this));
         uint256 denom = cash + totalBorrows;
         if (denom == 0) return 0;
         return (totalBorrows * BPS) / denom;
@@ -111,9 +112,19 @@ contract AssayPool is ERC20, ReentrancyGuard, CollateralReconciler {
     /// Interest accrual. Saturates rather than reverting: an aborting cast here would freeze
     /// repayment and withdrawal for everyone, turning an accounting problem into a total loss
     /// (the R2-2 lesson, carried over).
+    ///
+    /// PAUSE-AWARE. A Robinhood token pause blocks transfers, so a borrower physically cannot
+    /// repay. Charging interest across that window bills them for time in which repayment was
+    /// impossible — and it is the issuer's pause, not theirs. `accrueFor` skips paused intervals.
     function accrue() public {
         uint256 dt = block.timestamp - lastAccrual;
         if (dt == 0 || totalBorrows == 0) {
+            lastAccrual = block.timestamp;
+            return;
+        }
+        // Any paused collateral market suspends the clock: repayment is impossible pool-wide
+        // while the borrow asset or a collateral token cannot move.
+        if (_anyCollateralPaused()) {
             lastAccrual = block.timestamp;
             return;
         }
@@ -134,6 +145,25 @@ contract AssayPool is ERC20, ReentrancyGuard, CollateralReconciler {
         lastAccrual = block.timestamp;
     }
 
+    /// Tokens whose pause state suspends accrual. Kept as an explicit list rather than scanning
+    /// every position, so the cost is bounded and the operator controls the set.
+    address[] public accrualPauseWatch;
+
+    function setAccrualPauseWatch(address[] calldata tokens) external {
+        if (msg.sender != markets.admin()) revert NotBorrower();
+        accrualPauseWatch = tokens;
+    }
+
+    function _anyCollateralPaused() internal view returns (bool) {
+        uint256 n = accrualPauseWatch.length;
+        for (uint256 i = 0; i < n; i++) {
+            (bool ok, bytes memory ret) =
+                accrualPauseWatch[i].staticcall(abi.encodeWithSignature("paused()"));
+            if (ok && ret.length >= 32 && abi.decode(ret, (bool))) return true;
+        }
+        return false;
+    }
+
     function debtOf(uint256 id) public view returns (uint256) {
         Position memory p = positions[id];
         if (p.principal == 0) return 0;
@@ -143,28 +173,43 @@ contract AssayPool is ERC20, ReentrancyGuard, CollateralReconciler {
     // ---------------------------------------------------------------- lenders
 
     /// Lenders' claim: cash + outstanding borrows − the protocol's accrued cut.
-    function totalAssets() public view returns (uint256) {
-        uint256 cash = asset.balanceOf(address(this));
+    function totalAssets() public view override returns (uint256) {
+        uint256 cash = IERC20(asset()).balanceOf(address(this));
         uint256 gross = cash + totalBorrows;
         return gross > totalReserves ? gross - totalReserves : 0;
     }
 
-    function deposit(uint256 amount) external nonReentrant returns (uint256 shares) {
-        accrue();
-        uint256 assets_ = totalAssets();
-        uint256 supply = totalSupply();
-        shares = (supply == 0 || assets_ == 0) ? amount : (amount * supply) / assets_;
-        asset.safeTransferFrom(msg.sender, address(this), amount);
-        _mint(msg.sender, shares);
+    /// Virtual-share offset: the standard ERC-4626 inflation-attack mitigation.
+    ///
+    /// The hand-rolled version this replaced had none, and was exploitable exactly as the
+    /// textbook describes: deposit 1 wei, donate directly to the pool to inflate the share price,
+    /// and the next depositor's shares round to ZERO while the attacker redeems everything.
+    /// Confirmed by PoC before this rewrite. OZ's offset makes the donation cost grow by 10^6 per
+    /// unit of rounding stolen, which is what removes the attack rather than merely narrowing it.
+    function _decimalsOffset() internal pure override returns (uint8) {
+        return 6;
     }
 
-    function withdraw(uint256 shares) external nonReentrant returns (uint256 amount) {
+    /// Accrue before any share-price-sensitive operation, so deposits and withdrawals price
+    /// against current debt rather than a stale index.
+    function _deposit(address caller, address receiver, uint256 assets_, uint256 shares)
+        internal
+        override
+        nonReentrant
+    {
         accrue();
-        amount = (shares * totalAssets()) / totalSupply();
-        uint256 cash = asset.balanceOf(address(this));
-        if (amount > cash) revert InsufficientLiquidity(amount, cash);
-        _burn(msg.sender, shares);
-        asset.safeTransfer(msg.sender, amount);
+        super._deposit(caller, receiver, assets_, shares);
+    }
+
+    function _withdraw(address caller, address receiver, address owner_, uint256 assets_, uint256 shares)
+        internal
+        override
+        nonReentrant
+    {
+        accrue();
+        uint256 cash = IERC20(asset()).balanceOf(address(this));
+        if (assets_ > cash) revert InsufficientLiquidity(assets_, cash);
+        super._withdraw(caller, receiver, owner_, assets_, shares);
     }
 
     // ---------------------------------------------------------------- borrowers
@@ -183,6 +228,9 @@ contract AssayPool is ERC20, ReentrancyGuard, CollateralReconciler {
         // lending against a balance that no longer exists (the adminBurn hazard).
         _reconcile(token);
 
+        // A zero-debt position can never be repaid (repay reverts NoDebt) nor liquidated
+        // (isUnderwater is false at zero), so its collateral would be trapped forever.
+        if (debt == 0) revert NoDebt();
         uint256 max = markets.maxBorrow(token, collateralRaw);
         if (debt > max) revert Undercollateralised(debt, max);
 
@@ -190,14 +238,14 @@ contract AssayPool is ERC20, ReentrancyGuard, CollateralReconciler {
         uint256 cap = markets.market(token).cap;
         if (would > cap) revert ExceedsMarketCap(would, cap);
 
-        uint256 cash = asset.balanceOf(address(this));
+        uint256 cash = IERC20(asset()).balanceOf(address(this));
         if (debt > cash) revert InsufficientLiquidity(debt, cash);
 
         marketBorrows[token] = would;
         totalBorrows += debt;
         id = nextPositionId++;
         positions[id] = Position(msg.sender, token, collateralRaw, debt, borrowIndex);
-        asset.safeTransfer(msg.sender, debt);
+        IERC20(asset()).safeTransfer(msg.sender, debt);
         emit Borrowed(id, msg.sender, token, collateralRaw, debt);
     }
 
@@ -214,15 +262,16 @@ contract AssayPool is ERC20, ReentrancyGuard, CollateralReconciler {
         if (owed == 0) revert NoDebt();
         if (amount < owed) revert Undercollateralised(amount, owed);
 
-        asset.safeTransferFrom(msg.sender, address(this), owed);
+        IERC20(asset()).safeTransferFrom(msg.sender, address(this), owed);
         // Reconcile BEFORE closing. _closePosition debits recordedRaw, so reconciling afterwards
         // compares a zeroed ledger against the surviving balance and silently reports no
         // shortfall — the adminBurn would vanish from the accounting entirely.
         _reconcile(p.token);
+        // Pro-rata against what survives, computed BEFORE the ledger is debited (the nominal
+        // total is the denominator). This is what stops one borrower being made whole out of
+        // another's collateral after an adminBurn.
+        uint256 give = _effectiveCollateral(p.token, p.collateralRaw);
         _closePosition(id, p, owed);
-        uint256 give = p.collateralRaw;
-        uint256 actual = IERC20(p.token).balanceOf(address(this));
-        if (give > actual) give = actual; // issuer burned some; return what survives
         IERC20(p.token).safeTransfer(p.borrower, give);
         emit Repaid(id, owed, give);
     }
@@ -239,22 +288,25 @@ contract AssayPool is ERC20, ReentrancyGuard, CollateralReconciler {
         accrue();
 
         _reconcile(p.token);
+        // Health must be judged on collateral that STILL EXISTS. Using the stored figure made a
+        // position whose collateral had been burned away read as healthy — permanently
+        // unliquidatable while fully unsecured.
+        uint256 effective = _effectiveCollateral(p.token, p.collateralRaw);
         uint256 owed = debtOf(id);
-        if (!markets.isUnderwater(p.token, p.collateralRaw, owed)) revert PositionHealthy();
+        if (!markets.isUnderwater(p.token, effective, owed)) revert PositionHealthy();
 
-        asset.safeTransferFrom(msg.sender, address(this), owed);
-        _closePosition(id, p, owed);
+        IERC20(asset()).safeTransferFrom(msg.sender, address(this), owed);
+        _releaseDebt(p, owed);
 
         // Seize debt + bonus, valued at the live price, and never more than the position holds.
         uint256 bonusBps = markets.market(p.token).liqBonusBps;
         uint256 target = (owed * (BPS + bonusBps)) / BPS;
         uint256 seize = _rawWorth(p.token, target);
-        uint256 available = p.collateralRaw;
-        uint256 actual = IERC20(p.token).balanceOf(address(this));
-        if (available > actual) available = actual;
+        uint256 available = effective;
         if (seize > available) seize = available;
 
         uint256 refund = available - seize;
+        _closePositionTail(id, p);
         IERC20(p.token).safeTransfer(msg.sender, seize);
         if (refund > 0) IERC20(p.token).safeTransfer(p.borrower, refund);
         emit Liquidated(id, msg.sender, owed, seize, refund);
@@ -270,10 +322,21 @@ contract AssayPool is ERC20, ReentrancyGuard, CollateralReconciler {
     /// The ONE place a position's exposure is released (R5/R6). Two release paths on Sui
     /// double-released and made the cap stop binding; there is exactly one here by construction.
     function _closePosition(uint256 id, Position memory p, uint256 owed) internal {
+        _releaseDebt(p, owed);
+        _closePositionTail(id, p);
+    }
+
+    /// Debt-side release. Separated so liquidate can settle the debt, compute the seizure against
+    /// the still-intact ledger, and only then retire the position.
+    function _releaseDebt(Position memory p, uint256 owed) internal {
         totalBorrows = totalBorrows > owed ? totalBorrows - owed : 0;
         uint256 mb = marketBorrows[p.token];
         marketBorrows[p.token] = mb > p.principal ? mb - p.principal : 0;
-        _debitCollateral(p.token, p.collateralRaw > recordedRaw[p.token] ? recordedRaw[p.token] : p.collateralRaw);
+    }
+
+    /// Collateral-side release. The ONE place a position leaves the books (R5/R6).
+    function _closePositionTail(uint256 id, Position memory p) internal {
+        _debitCollateral(p.token, p.collateralRaw);
         delete positions[id];
     }
 }

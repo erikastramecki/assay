@@ -35,6 +35,8 @@ contract AssayMarkets is StaleFeedGuard {
         uint16 ltvBps; // max borrow against collateral value
         uint16 liqThresholdBps; // liquidation trigger
         uint16 liqBonusBps; // liquidator's cut, above the debt
+        /// The collateral token's own decimals. REQUIRED for normalisation — see collateralValue.
+        uint8 collateralDecimals;
         uint128 cap; // per-collateral exposure cap, in borrow-asset units
     }
 
@@ -64,20 +66,36 @@ contract AssayMarkets is StaleFeedGuard {
 
     address public immutable admin;
     LivenessOracle public immutable liveness;
+    /// Decimals of the BORROW asset (USDG = 6 on Robinhood Chain). Everything this contract
+    /// returns is denominated in these units so debt and collateral are directly comparable.
+    uint8 public immutable assetDecimals;
 
     mapping(address => Market) internal _markets;
     mapping(address => PendingMarket) internal _pending;
 
-    constructor(AggregatorV3Interface sequencerUptimeFeed_, LivenessOracle liveness_, address admin_)
-        StaleFeedGuard(sequencerUptimeFeed_)
-    {
+    constructor(
+        AggregatorV3Interface sequencerUptimeFeed_,
+        LivenessOracle liveness_,
+        address admin_,
+        uint8 assetDecimals_
+    ) StaleFeedGuard(sequencerUptimeFeed_) {
         liveness = liveness_;
         admin = admin_;
+        assetDecimals = assetDecimals_;
     }
 
     // ---------------------------------------------------------------- risk math
 
-    /// USD value of `rawAmount` units of `token`, using the LIVE corporate-action multiplier.
+    /// Value of `rawAmount` units of `token`, DENOMINATED IN THE BORROW ASSET's decimals.
+    ///
+    /// DECIMAL NORMALISATION IS THE WHOLE POINT OF THIS FUNCTION. On Robinhood Chain the three
+    /// scales genuinely differ — USDG has 6 decimals, Stock Tokens have 18, Chainlink feeds have
+    /// 8 (all verified on mainnet). An earlier version divided out only the feed decimals and
+    /// returned a collateral-scaled number, which was then compared against a 6-decimal debt:
+    /// every LTV limit was 1e12 too permissive, and a $2,000 position could drain the pool. The
+    /// bug was invisible to the test suite because its mock borrow asset used 18 decimals.
+    ///
+    ///   value = uiAmount x price x 10^assetDec / (10^collDec x 10^feedDec)
     ///
     /// Reverts if the price is unusable (silent oracle, sequencer down). Callers get no price
     /// rather than a stale one — an unknown price must never round to a usable number.
@@ -86,13 +104,15 @@ contract AssayMarkets is StaleFeedGuard {
         view
         returns (uint256 value, bool inSession)
     {
+        Market memory mk = _markets[token];
+        if (!mk.enabled) revert MarketNotEnabled(token);
         uint256 price;
-        uint8 dec;
-        (price, dec, inSession) = priceOf(token);
+        uint8 feedDec;
+        (price, feedDec, inSession) = priceOf(token);
         // balanceOf is raw and stable; the share-equivalent moves on splits. Pricing the raw
         // amount is correct until the first corporate action and catastrophically wrong after.
         uint256 uiAmount = (rawAmount * IScaledUI(token).uiMultiplier()) / 1e18;
-        value = (uiAmount * price) / (10 ** dec);
+        value = (uiAmount * price * (10 ** assetDecimals)) / (10 ** mk.collateralDecimals * 10 ** feedDec);
     }
 
     /// Most that may be borrowed against `rawAmount` of `token`, in borrow-asset units.
@@ -185,6 +205,7 @@ contract AssayMarkets is StaleFeedGuard {
         if (m.liqThresholdBps - m.ltvBps < MIN_RISK_GAP_BPS) revert InvalidRiskParams("risk gap too narrow");
         if (m.liqBonusBps > MAX_LIQ_BONUS_BPS) revert InvalidRiskParams("bonus too high");
         if (m.cap == 0) revert InvalidRiskParams("cap must be set");
+        if (m.collateralDecimals == 0 || m.collateralDecimals > 36) revert InvalidRiskParams("bad collateral decimals");
     }
 
     function _requireEnabled(address token) internal view returns (Market memory m) {
