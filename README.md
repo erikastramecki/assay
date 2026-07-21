@@ -8,6 +8,8 @@ attestation verified in-Move.
 
 **Live demo (devnet):** https://assay-sui.vercel.app  ·  Operator API: https://assay-operator-sui.vercel.app
 
+**Security audits:** [docs/audits/](docs/audits/) — adversarial rounds with independent verification, published fix-first. **[docs/OUTSTANDING.md](docs/OUTSTANDING.md)** lists everything known-open, including items that block mainnet.
+
 > Devnet + test assets only. Not an offer of securities. See `docs/` for the full design, risk
 > framework, interest-rate model, and security audit.
 
