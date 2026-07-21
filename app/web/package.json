@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
+    "dev": "node gen-docs.mjs && vite",
+    "build": "node gen-docs.mjs && vite build",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview"
   },
@@ -13,6 +13,8 @@
     "@mysten/dapp-kit": "^0.14.53",
     "@mysten/sui": "1.24.0",
     "@tanstack/react-query": "^5.101.2",
+    "@types/dompurify": "^3.0.5",
+    "dompurify": "^3.4.12",
     "marked": "^12.0.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
