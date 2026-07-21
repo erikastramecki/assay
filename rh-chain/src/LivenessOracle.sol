@@ -27,6 +27,7 @@ contract LivenessOracle {
     error NotKeeper();
     error NotGuardian();
     error ZeroAddress();
+    error BadGapThreshold();
 
     event Heartbeat(uint256 at);
     event GapDetected(uint256 gapSeconds, uint256 liquidationsResumeAt);
@@ -40,6 +41,15 @@ contract LivenessOracle {
 
     /// Heartbeat older than this means the chain (or the keeper) is not demonstrably live.
     uint256 public immutable maxHeartbeatAge;
+    /// A gap LARGER THAN THIS between consecutive heartbeats counts as an outage and starts the
+    /// grace period.
+    ///
+    /// Deliberately TIGHTER than maxHeartbeatAge. Using the liveness bound for both meant an
+    /// outage shorter than maxHeartbeatAge was invisible: the heartbeat never went stale, no gap
+    /// was recorded, and liquidations resumed in the first block back — which is precisely the
+    /// restart-liquidation this contract exists to prevent, just at a smaller scale. Set to a
+    /// small multiple of the keeper's beat interval, so a couple of missed beats trips it.
+    uint256 public immutable gapThreshold;
     /// After a detected gap, liquidations stay disabled this long so borrowers can react.
     /// Mirrors Chainlink's own recommended sequencer grace period.
     uint256 public immutable resumeGrace;
@@ -48,12 +58,20 @@ contract LivenessOracle {
     /// Timestamp until which liquidations remain disabled following a gap. 0 = none pending.
     uint256 public liquidationsResumeAt;
 
-    constructor(address keeper_, address guardian_, uint256 maxHeartbeatAge_, uint256 resumeGrace_) {
+    constructor(
+        address keeper_,
+        address guardian_,
+        uint256 maxHeartbeatAge_,
+        uint256 resumeGrace_,
+        uint256 gapThreshold_
+    ) {
         if (keeper_ == address(0) || guardian_ == address(0)) revert ZeroAddress();
+        if (gapThreshold_ == 0 || gapThreshold_ > maxHeartbeatAge_) revert BadGapThreshold();
         keeper = keeper_;
         guardian = guardian_;
         maxHeartbeatAge = maxHeartbeatAge_;
         resumeGrace = resumeGrace_;
+        gapThreshold = gapThreshold_;
         // Deliberately NOT seeded with block.timestamp. A fresh deployment has not proven liveness,
         // so it starts closed and opens on the first heartbeat.
         lastHeartbeat = 0;
@@ -73,7 +91,7 @@ contract LivenessOracle {
         // prev == 0 is the first-ever heartbeat: treat it as a gap so a fresh deployment also
         // serves out the grace period rather than opening instantly.
         uint256 gap = prev == 0 ? type(uint256).max : block.timestamp - prev;
-        if (gap > maxHeartbeatAge) {
+        if (gap > gapThreshold) {
             liquidationsResumeAt = block.timestamp + resumeGrace;
             emit GapDetected(gap == type(uint256).max ? 0 : gap, liquidationsResumeAt);
         }

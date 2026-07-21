@@ -178,12 +178,43 @@ contract StaleFeedGuardTest is Test {
         assertFalse(g.sequencerCheckDisabled());
     }
 
-    function test_marketHoursBoundaries() public view {
+    /// The session window is the INTERSECTION of the EST and EDT mappings: 14:30-20:00 UTC.
+    ///
+    /// The previous version of this test asserted 20:59 UTC was in-session, which is only true
+    /// under EST. During EDT that same instant is 16:59 ET — an hour AFTER the close. The test
+    /// enshrined the bug it should have caught, by labelling EDT timestamps as ET.
+    function test_marketHoursBoundariesAreConservativeAcrossDst() public view {
         uint256 day = (MON_IN_SESSION / 86400) * 86400;
-        assertFalse(g.isUsMarketHours(day + 14 hours + 29 minutes)); // 09:29 ET
-        assertTrue(g.isUsMarketHours(day + 14 hours + 30 minutes));  // 09:30 ET open
-        assertTrue(g.isUsMarketHours(day + 20 hours + 59 minutes));  // 15:59 ET
-        assertFalse(g.isUsMarketHours(day + 21 hours));              // 16:00 ET close
+        assertFalse(g.isUsMarketHours(day + 14 hours + 29 minutes), "before the latest open");
+        assertTrue(g.isUsMarketHours(day + 14 hours + 30 minutes), "EST open");
+        assertTrue(g.isUsMarketHours(day + 19 hours + 59 minutes), "inside both windows");
+        // 20:00 UTC is 16:00 ET under EDT — the market is SHUT. Must not report in-session,
+        // even though under EST it would still be 15:00 ET and open.
+        assertFalse(g.isUsMarketHours(day + 20 hours), "EDT close - the unsafe direction");
+        assertFalse(g.isUsMarketHours(day + 20 hours + 59 minutes), "never open after the EDT close");
+    }
+
+    /// MARKET HOLIDAYS. The calendar knows weekends, not holidays. On a holiday the clock says
+    /// in-session while the feed has not printed since the previous close — and an 18-24h holiday
+    /// gap fits inside the 25h staleness bound, so staleness cannot catch it.
+    function test_holidayIsNotReportedAsInSession() public {
+        uint256 day = (MON_IN_SESSION / 86400) * 86400;
+        uint256 midSession = day + 16 hours; // clock says open
+        // last print was yesterday's close — the market never opened today
+        px.set(200e8, day - 4 hours);
+        vm.warp(midSession);
+        assertTrue(g.isUsMarketHours(midSession), "the calendar alone believes it is a session");
+        (,, bool inSession) = g.priceOf(TOK);
+        assertFalse(inSession, "but no print since today's open -> treated as closed");
+    }
+
+    function test_normalSessionWithATodayPrintIsInSession() public {
+        uint256 day = (MON_IN_SESSION / 86400) * 86400;
+        uint256 midSession = day + 16 hours;
+        px.set(200e8, day + 15 hours); // printed after today's open
+        vm.warp(midSession);
+        (,, bool inSession) = g.priceOf(TOK);
+        assertTrue(inSession, "a normal session must still work");
     }
 
     function test_weekendIsNeverInSession() public view {

@@ -38,6 +38,7 @@ contract AssayPoolTest is Test {
     uint256 constant MON_IN_SESSION = 1_753_110_000;
     uint256 constant MAX_AGE = 15 minutes;
     uint256 constant GRACE = 1 hours;
+    uint256 constant GAP = 10 minutes; // ~2 missed beats at a 5-minute cadence
 
     function setUp() public {
         ADMIN = makeAddr("admin"); KEEPER = makeAddr("keeper"); GUARDIAN = makeAddr("guardian");
@@ -48,7 +49,7 @@ contract AssayPoolTest is Test {
         px = new MockFeed(200e8, 8); // $200/share
         tok = new MockStock();
         usdg = new MockUSDG();
-        liv = new LivenessOracle(KEEPER, GUARDIAN, MAX_AGE, GRACE);
+        liv = new LivenessOracle(KEEPER, GUARDIAN, MAX_AGE, GRACE, GAP);
         mk = new AssayMarkets(AggregatorV3Interface(address(seq)), liv, ADMIN, 6); // USDG is 6dp
         // zero-rate pool: isolates the invariants under test from accrual drift
         pool = new AssayPool(usdg, mk, 0, 0, 0, 0);
@@ -342,6 +343,70 @@ contract AssayPoolTest is Test {
         uint256 back = p2.redeem(victimShares, VICTIM, VICTIM);
         vm.stopPrank();
         assertGe(back, 99_000e6, "victim recovers substantially all of their deposit");
+    }
+
+    // ------------------------------------------------- guards found by mutation sweep
+
+    function test_onlyAdminCanSetTheAccrualPauseWatch() public {
+        address[] memory w = new address[](1); w[0] = address(tok);
+        vm.prank(ALICE);
+        vm.expectRevert(AssayPool.NotBorrower.selector);
+        pool.setAccrualPauseWatch(w);
+    }
+
+    function test_withdrawBeyondAvailableCashReverts() public {
+        _borrow(700e6);
+        uint256 cash = usdg.balanceOf(address(pool));
+        vm.prank(LENDER);
+        // Assert the SPECIFIC error: a bare expectRevert() also matches the SafeERC20 failure
+        // that would occur anyway, so it passed with the guard deleted. Found by mutation sweep.
+        vm.expectRevert(abi.encodeWithSelector(AssayPool.InsufficientLiquidity.selector, cash + 1, cash));
+        pool.withdraw(cash + 1, LENDER, LENDER);
+    }
+
+    function test_borrowBeyondMarketCapReverts() public {
+        AssayMarkets.Market memory m = AssayMarkets.Market({
+            enabled: true, ltvBps: 3_500, liqThresholdBps: 5_500, liqBonusBps: 800,
+            collateralDecimals: 18, cap: 500e6 // cap below one max-LTV loan
+        });
+        vm.startPrank(ADMIN);
+        mk.proposeMarket(address(tok), AggregatorV3Interface(address(px)), 90_000, 8, m);
+        vm.warp(block.timestamp + mk.PARAM_TIMELOCK());
+        px.set(200e8, block.timestamp);
+        mk.commitMarket(address(tok));
+        vm.stopPrank();
+        _beat(); _advanceLive(GRACE);
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(AssayPool.ExceedsMarketCap.selector, 700e6, 500e6));
+        pool.borrow(address(tok), 10e18, 700e6);
+    }
+
+    function test_borrowBeyondPoolLiquidityReverts() public {
+        AssayPool p2 = new AssayPool(usdg, mk, 0, 0, 0, 0); // empty pool: no cash at all
+        vm.startPrank(ALICE);
+        tok.approve(address(p2), type(uint256).max);
+        vm.expectRevert(abi.encodeWithSelector(AssayPool.InsufficientLiquidity.selector, 700e6, 0));
+        p2.borrow(address(tok), 10e18, 700e6);
+        vm.stopPrank();
+    }
+
+    function test_repayOnAClosedPositionReverts() public {
+        uint256 id = _borrow(700e6);
+        vm.startPrank(ALICE);
+        pool.repay(id, 700e6);
+        // The position is deleted, so borrower is address(0) and the ownership check fires first.
+        vm.expectRevert(AssayPool.NotBorrower.selector);
+        pool.repay(id, 700e6);
+        vm.stopPrank();
+    }
+
+    function test_liquidatingAClosedPositionReverts() public {
+        uint256 id = _borrow(700e6);
+        vm.prank(ALICE);
+        pool.repay(id, 700e6);
+        vm.prank(LIQUIDATOR);
+        vm.expectRevert(AssayPool.NoDebt.selector);
+        pool.liquidate(id);
     }
 
     function test_curveSumIsBounded() public {

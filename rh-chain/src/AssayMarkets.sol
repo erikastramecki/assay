@@ -208,6 +208,9 @@ contract AssayMarkets is StaleFeedGuard {
         if (m.collateralDecimals == 0 || m.collateralDecimals > 36) revert InvalidRiskParams("bad collateral decimals");
     }
 
+    /// Deliberately redundant with the enabled-check inside `collateralValue`: it fails fast with
+    /// the right error before any oracle work. A mutation sweep flags it as deletable for exactly
+    /// that reason — the redundancy is intentional, not an untested guard.
     function _requireEnabled(address token) internal view returns (Market memory m) {
         m = _markets[token];
         if (!m.enabled) revert MarketNotEnabled(token);

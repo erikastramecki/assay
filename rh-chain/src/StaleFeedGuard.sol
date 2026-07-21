@@ -146,28 +146,57 @@ contract StaleFeedGuard {
         // not try to detect a stale market — see the note at the top of this file.
         if (age > c.maxStaleness) revert PriceStale(age, c.maxStaleness, inSession);
 
+        // MARKET HOLIDAYS. The calendar above knows weekends but not holidays, so on Thanksgiving
+        // it reports "in session" while the feed has not published since the previous trading
+        // day's close. The staleness bound cannot catch it — an 18-24h holiday gap fits inside a
+        // 25h bound. So: if we believe we are in session, the feed must have published AT OR AFTER
+        // today's open. On a holiday the last print is from yesterday and this correctly refuses.
+        //
+        // A very quiet stock that has not moved 0.5% since the open would also be refused. That is
+        // the conservative direction — declining to lend on an unconfirmed price — and is accepted.
+        if (inSession && updatedAt < _sessionOpenOf(block.timestamp)) {
+            inSession = false;
+        }
+
         return (uint256(answer), c.decimals, inSession);
     }
 
-    /// Coarse US equity regular session: 09:30–16:00 ET, Mon–Fri.
+    /// US equity regular session, computed CONSERVATIVELY across both US time zones.
     ///
-    /// DELIBERATELY COARSE, AND DELIBERATELY WRONG IN THE SAFE DIRECTION. It ignores holidays and
-    /// DST, so it will occasionally report "in session" when the market is actually shut. That is
-    /// survivable only because the staleness check is the real gate: on a holiday the feed simply
-    /// stops updating and `PriceStale` fires. Session state is a haircut input, never the sole
-    /// freshness guarantee — do not invert that relationship.
+    /// Eastern time is UTC-5 in winter (EST) and UTC-4 in summer (EDT), so the session maps to a
+    /// different UTC window depending on the date:
+    ///     EST  09:30-16:00 ET  ->  14:30-21:00 UTC
+    ///     EDT  09:30-16:00 ET  ->  13:30-20:00 UTC
     ///
-    /// Uses UTC-5 as a fixed offset. During EDT the window is off by an hour, which shifts the
-    /// haircut boundary rather than admitting a stale price.
+    /// A previous version hardcoded the EST window. During EDT that reported "in session" for the
+    /// hour AFTER the market closed — the unsafe direction, since it would admit new borrowing
+    /// against a market that had already shut.
+    ///
+    /// Rather than implement the DST calendar on-chain, this returns the INTERSECTION of the two
+    /// windows: 14:30-20:00 UTC. It is therefore never open when the market is shut, and gives up
+    /// the first hour of an EST session and the last hour of an EDT one. Losing an hour of
+    /// borrowing availability is the correct trade against ever lending into a closed market; a
+    /// proper DST implementation would recover it.
     function isUsMarketHours(uint256 ts) public pure returns (bool) {
-        uint256 daysSinceEpoch = ts / 86400;
-        // 1970-01-01 was a Thursday: 0=Thu. Map to 0=Mon.
-        uint256 dow = (daysSinceEpoch + 3) % 7; // 0=Mon … 6=Sun
-        if (dow >= 5) return false; // weekend
-
+        if (!_isWeekday(ts)) return false;
         uint256 secondsOfDayUtc = ts % 86400;
-        // ET = UTC-5 (EST). 09:30 ET = 14:30 UTC, 16:00 ET = 21:00 UTC.
-        return secondsOfDayUtc >= 14 hours + 30 minutes && secondsOfDayUtc < 21 hours;
+        return secondsOfDayUtc >= SESSION_OPEN_UTC && secondsOfDayUtc < SESSION_CLOSE_UTC;
+    }
+
+    /// 14:30 UTC — the later of the two session opens (EST). Conservative.
+    uint256 public constant SESSION_OPEN_UTC = 14 hours + 30 minutes;
+    /// 20:00 UTC — the earlier of the two session closes (EDT). Conservative.
+    uint256 public constant SESSION_CLOSE_UTC = 20 hours;
+
+    function _isWeekday(uint256 ts) internal pure returns (bool) {
+        // 1970-01-01 was a Thursday: shift so 0 = Monday.
+        uint256 dow = ((ts / 86400) + 3) % 7;
+        return dow < 5;
+    }
+
+    /// The start of today's session, in absolute time.
+    function _sessionOpenOf(uint256 ts) internal pure returns (uint256) {
+        return (ts / 86400) * 86400 + SESSION_OPEN_UTC;
     }
 
     function feedConfig(address token) external view returns (FeedConfig memory) {

@@ -79,14 +79,40 @@ accrual suspends while a watched collateral token is paused.
 
 | # | Severity | Surface | Status |
 |---|---|---|---|
-| 1 | medium | `StaleFeedGuard` — session calendar, DST | open |
-| 2 | medium | `StaleFeedGuard` — session calendar, market holidays | open |
-| 3 | medium | `LivenessOracle` — short-outage coverage | open |
-| 4 | medium | test coverage — surviving guard mutations | open |
-| 5 | low | misc. hygiene, dead declarations | open |
+All four mediums are now **fixed** — detail below. Nothing in `rh-chain/` is deployed to any
+network, so none of this was ever live exposure.
 
-Nothing in `rh-chain/` is deployed to any network, so these are pre-deployment defects rather than
-live exposure.
+### MEDIUM — the session calendar was an hour wrong half the year (fixed)
+`isUsMarketHours` hardcoded the EST mapping (14:30-21:00 UTC). During EDT that reported
+"in session" for the hour AFTER the close — the unsafe direction, admitting borrowing into a shut
+market. **Fix:** the window is now the INTERSECTION of the EST and EDT mappings, 14:30-20:00 UTC,
+so it is never open when the market is shut. It gives up an hour of availability; a full DST
+implementation would recover it.
+
+The existing boundary test asserted 20:59 UTC was in-session, which is only true under EST — the
+test **enshrined the bug it should have caught**. Rewritten.
+
+### MEDIUM — market holidays read as in-session (fixed)
+The calendar knows weekends, not holidays. On Thanksgiving the clock says in-session while the feed
+has not printed since the previous close, and an 18-24h holiday gap fits inside the 25h staleness
+bound, so staleness could not catch it. A source comment claimed it did. **Fix:** if the clock says
+in-session, the feed must have printed at or after **today's** open; otherwise the session is
+treated as closed. A very quiet stock is also refused, which is the conservative direction.
+
+### MEDIUM — short outages slipped past the liveness gate (fixed)
+`LivenessOracle` used `maxHeartbeatAge` as both the liveness bound and the gap detector, so an
+outage shorter than it was invisible: the heartbeat never went stale, no gap was recorded, and
+liquidations resumed in the first block back — the exact restart-liquidation the contract exists to
+prevent, at a smaller scale. **Fix:** a separate, tighter `gapThreshold`, validated to be below the
+liveness bound.
+
+### MEDIUM — surviving guard mutations (fixed)
+A systematic sweep — deleting every single-line guard in all five contracts, one at a time — found
+**13 deletable with a green suite**. Twelve now fail their mutation. Two of those were not missing
+tests at all but **bare `expectRevert()` calls**, which match any revert including the one that
+would happen anyway; they passed with the guard deleted. One guard was genuinely unreachable and
+was removed rather than papered over. The single remaining survivor is a deliberately redundant
+fail-fast check, documented as such in the source.
 
 ---
 

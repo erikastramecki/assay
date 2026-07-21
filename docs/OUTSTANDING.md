@@ -45,11 +45,8 @@ upgrade in place. Needs a fresh package, a fresh pool, and a new `VITE_POOL`.
 
 | Severity | Item |
 |---|---|
-| medium | `isUsMarketHours` uses a fixed UTC-5 offset, so the session window is an hour wrong during EDT. One existing test **enshrines the bug** by labelling EDT timestamps as ET. |
-| medium | Market holidays: the feed stops updating but the clock says in-session, and the 25h staleness bound does not catch an 18–24h holiday gap. A source comment claims staleness covers this. It does not. |
-| medium | `LivenessOracle` does not protect against outages **shorter than `maxHeartbeatAge`** — the restart-liquidation window it exists to close is still open below that threshold. |
-| medium | Guard mutations still surviving a green suite, from the 18 the audit found. Each survivor is a guard nothing proves is load-bearing. |
-| low | Dead declarations and hygiene. |
+| — | All four round-1 mediums are fixed (DST, market holidays, short outages, surviving mutations). See the [round-1 report](audits/solidity-round-1.md). |
+| — | **A clean audit round has not yet been run against these fixes.** Fixing findings does not clear the gate; only a round where all three auditors return clean does. |
 
 Nothing in `rh-chain/` is deployed to any network.
 

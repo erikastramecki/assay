@@ -11,12 +11,13 @@ contract LivenessOracleTest is Test {
 
     uint256 constant MAX_AGE = 15 minutes;
     uint256 constant GRACE = 1 hours;
+    uint256 constant GAP = 10 minutes; // ~2 missed beats at a 5-minute cadence
 
     function setUp() public {
         KEEPER = makeAddr("keeper");
         GUARDIAN = makeAddr("guardian");
         vm.warp(1_753_110_000);
-        o = new LivenessOracle(KEEPER, GUARDIAN, MAX_AGE, GRACE);
+        o = new LivenessOracle(KEEPER, GUARDIAN, MAX_AGE, GRACE, GAP);
     }
 
     function _beat() internal {
@@ -35,7 +36,7 @@ contract LivenessOracleTest is Test {
     /// minus a zero lastHeartbeat is small — so without the explicit zero check the oracle would
     /// read as OPEN on a fresh chain. Found by mutation: deleting that check passed every other test.
     function test_neverBeatIsClosedEvenAtLowTimestamps() public {
-        LivenessOracle fresh = new LivenessOracle(KEEPER, GUARDIAN, MAX_AGE, GRACE);
+        LivenessOracle fresh = new LivenessOracle(KEEPER, GUARDIAN, MAX_AGE, GRACE, GAP);
         vm.warp(60); // 60s after genesis: younger than maxHeartbeatAge
         assertEq(fresh.lastHeartbeat(), 0);
         assertFalse(fresh.liquidationsAllowed(), "must be closed because it has NEVER beat");
@@ -108,6 +109,28 @@ contract LivenessOracleTest is Test {
         assertFalse(o.liquidationsAllowed());
     }
 
+    /// SHORT OUTAGE. An outage briefer than maxHeartbeatAge used to be invisible: the heartbeat
+    /// never went stale, no gap was recorded, and liquidations resumed in the first block back —
+    /// the exact restart-liquidation this contract exists to prevent, at a smaller scale.
+    function test_outageShorterThanMaxAgeStillTripsTheGrace() public {
+        _bringOnline();
+        // 12 minutes: longer than the 10-minute gap threshold, SHORTER than the 15-minute
+        // liveness bound, so liveness alone would never have noticed.
+        vm.warp(block.timestamp + 12 minutes);
+        assertLt(12 minutes, MAX_AGE, "fixture must be inside the liveness bound");
+        _beat();
+        assertFalse(o.liquidationsAllowed(), "a short outage must still start the grace");
+        _advanceLive(GRACE);
+        assertTrue(o.liquidationsAllowed());
+    }
+
+    function test_gapThresholdMustBeTighterThanLiveness() public {
+        vm.expectRevert(LivenessOracle.BadGapThreshold.selector);
+        new LivenessOracle(KEEPER, GUARDIAN, MAX_AGE, GRACE, MAX_AGE + 1);
+        vm.expectRevert(LivenessOracle.BadGapThreshold.selector);
+        new LivenessOracle(KEEPER, GUARDIAN, MAX_AGE, GRACE, 0);
+    }
+
     function test_onlyKeeperCanBeat() public {
         vm.expectRevert(LivenessOracle.NotKeeper.selector);
         o.heartbeat();
@@ -120,6 +143,12 @@ contract LivenessOracleTest is Test {
         assertEq(o.keeper(), k2);
         vm.prank(k2);
         o.heartbeat(); // new keeper works
+    }
+
+    function test_keeperCannotBeRotatedToZero() public {
+        vm.prank(GUARDIAN);
+        vm.expectRevert(LivenessOracle.ZeroAddress.selector);
+        o.setKeeper(address(0));
     }
 
     function test_nonGuardianCannotRotateKeeper() public {
@@ -139,8 +168,8 @@ contract LivenessOracleTest is Test {
 
     function test_zeroAddressRejected() public {
         vm.expectRevert(LivenessOracle.ZeroAddress.selector);
-        new LivenessOracle(address(0), GUARDIAN, MAX_AGE, GRACE);
+        new LivenessOracle(address(0), GUARDIAN, MAX_AGE, GRACE, GAP);
         vm.expectRevert(LivenessOracle.ZeroAddress.selector);
-        new LivenessOracle(KEEPER, address(0), MAX_AGE, GRACE);
+        new LivenessOracle(KEEPER, address(0), MAX_AGE, GRACE, GAP);
     }
 }

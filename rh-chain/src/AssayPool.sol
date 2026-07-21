@@ -258,8 +258,10 @@ contract AssayPool is ERC4626, ReentrancyGuard, CollateralReconciler {
         accrue();
         Position memory p = positions[id];
         if (p.borrower != msg.sender) revert NotBorrower();
+        // No zero-debt check: borrow() rejects debt == 0, so an open position always owes
+        // something, and a closed one fails the borrower check above. A guard here would be
+        // unreachable — the mutation sweep proved it by deleting it with the suite still green.
         uint256 owed = debtOf(id);
-        if (owed == 0) revert NoDebt();
         if (amount < owed) revert Undercollateralised(amount, owed);
 
         IERC20(asset()).safeTransferFrom(msg.sender, address(this), owed);

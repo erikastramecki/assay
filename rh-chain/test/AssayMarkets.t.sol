@@ -23,6 +23,7 @@ contract AssayMarketsTest is Test {
     uint256 constant MON_IN_SESSION = 1_753_110_000;
     uint256 constant MAX_AGE = 15 minutes;
     uint256 constant GRACE = 1 hours;
+    uint256 constant GAP = 10 minutes; // ~2 missed beats at a 5-minute cadence
 
     // The conservative v1 stance: 35% LTV / 55% liquidation = a 20pp gap.
     function _conservative() internal pure returns (AssayMarkets.Market memory) {
@@ -42,7 +43,7 @@ contract AssayMarketsTest is Test {
         seq.setStartedAt(block.timestamp - 2 days);
         px = new MockFeed(200e8, 8); // $200
         tok = new MockStock();
-        liv = new LivenessOracle(KEEPER, GUARDIAN, MAX_AGE, GRACE);
+        liv = new LivenessOracle(KEEPER, GUARDIAN, MAX_AGE, GRACE, GAP);
         mk = new AssayMarkets(AggregatorV3Interface(address(seq)), liv, ADMIN, 6); // USDG is 6dp
 
         _enable(_conservative());
@@ -193,6 +194,54 @@ contract AssayMarketsTest is Test {
         m.cap = 0;
         vm.prank(ADMIN);
         vm.expectRevert(abi.encodeWithSelector(AssayMarkets.InvalidRiskParams.selector, "cap must be set"));
+        mk.proposeMarket(address(tok), AggregatorV3Interface(address(px)), 90_000, 8, m);
+    }
+
+    // ------------------------------------------------- guards found by mutation sweep
+
+    function test_collateralValueOnADisabledMarketReverts() public {
+        vm.prank(ADMIN);
+        mk.disableMarket(address(tok));
+        vm.expectRevert(abi.encodeWithSelector(AssayMarkets.MarketNotEnabled.selector, address(tok)));
+        mk.collateralValue(address(tok), 1e18);
+    }
+
+    function test_onlyAdminCanCommit() public {
+        vm.prank(ADMIN);
+        mk.proposeMarket(address(tok), AggregatorV3Interface(address(px)), 90_000, 8, _conservative());
+        vm.warp(block.timestamp + mk.PARAM_TIMELOCK());
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(AssayMarkets.NotAdmin.selector);
+        mk.commitMarket(address(tok));
+    }
+
+    function test_disabledMarketCannotBeProposed() public {
+        AssayMarkets.Market memory m = _conservative();
+        m.enabled = false;
+        vm.prank(ADMIN);
+        vm.expectRevert(abi.encodeWithSelector(AssayMarkets.InvalidRiskParams.selector, "market must be enabled"));
+        mk.proposeMarket(address(tok), AggregatorV3Interface(address(px)), 90_000, 8, m);
+    }
+
+    function test_thresholdAboveCeilingIsRejected() public {
+        AssayMarkets.Market memory m = _conservative();
+        m.liqThresholdBps = 9_500; // above MAX_LIQ_THRESHOLD_BPS
+        vm.prank(ADMIN);
+        vm.expectRevert(abi.encodeWithSelector(AssayMarkets.InvalidRiskParams.selector, "threshold too high"));
+        mk.proposeMarket(address(tok), AggregatorV3Interface(address(px)), 90_000, 8, m);
+    }
+
+    /// The decimals field is what makes valuation correct across USDG(6)/token(18)/feed(8).
+    /// A zero or absurd value would silently misprice every position.
+    function test_badCollateralDecimalsAreRejected() public {
+        AssayMarkets.Market memory m = _conservative();
+        m.collateralDecimals = 0;
+        vm.prank(ADMIN);
+        vm.expectRevert(abi.encodeWithSelector(AssayMarkets.InvalidRiskParams.selector, "bad collateral decimals"));
+        mk.proposeMarket(address(tok), AggregatorV3Interface(address(px)), 90_000, 8, m);
+        m.collateralDecimals = 37;
+        vm.prank(ADMIN);
+        vm.expectRevert(abi.encodeWithSelector(AssayMarkets.InvalidRiskParams.selector, "bad collateral decimals"));
         mk.proposeMarket(address(tok), AggregatorV3Interface(address(px)), 90_000, 8, m);
     }
 
