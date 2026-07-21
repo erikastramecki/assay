@@ -9,6 +9,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WEB="$HERE/web"; OPDIR="$HERE/operator-api"; OPV="$OPDIR/assay-operator"
 WEB_ALIAS=assay-sui.vercel.app; OP_ALIAS=assay-operator-sui.vercel.app
+
+
 fail() { echo "❌ $1"; exit 1; }
 . "$HERE/lib-operator-env.sh"
 
@@ -35,7 +37,12 @@ fi
 if [ "$do_web" = 1 ]; then
   echo "── web: gen-docs + build + deploy ──"
   ( cd "$WEB" && node gen-docs.mjs >/dev/null && npx vite build >/dev/null 2>&1 ) || fail "web build failed"
-  printf '%s' "$SPA_REWRITE" > "$WEB/dist/vercel.json"
+  # dist/ is the deploy root, so it needs its OWN vercel.json — app/web/vercel.json is not part
+  # of the upload, and without this the SPA rewrites and every security header are silently
+  # dropped. Derived from the real config so the two cannot drift; build settings are stripped
+  # because dist is already built.
+  node -e 'const c=require("./app/web/vercel.json");require("fs").writeFileSync("./app/web/dist/vercel.json",JSON.stringify({rewrites:c.rewrites,headers:c.headers},null,2))' \
+    || fail "could not derive dist/vercel.json"
   deploy_and_alias "$WEB/dist" "https://[a-z0-9-]+\.vercel\.app" "$WEB_ALIAS" || fail "web deploy/alias failed"
 fi
 
