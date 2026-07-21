@@ -1,10 +1,25 @@
-# Assay — provably-safe RWA lending on Sui
+# Assay — RWA lending built around a formally-verified risk kernel
 
-A Sui-native lending protocol: borrow USDC against 68 markets of collateral (crypto + tokenized
-stocks/xStocks), where the core solvency rule is enforced by a **formally-verified risk kernel**
-(dregg) and settlement is gated by an **on-chain zk proof** (`sui::groth16`). Non-custodial: the
-borrower sends the tx and supplies collateral; the operator's authorization is an ed25519
-attestation verified in-Move.
+Multi-chain lending against tokenized real-world assets. Borrow a stablecoin against crypto and
+tokenized equities, where the solvency rule is designed to be enforced by a **formally-verified
+risk kernel** (dregg) with settlement gated by an **on-chain zk proof** (`sui::groth16`).
+Non-custodial throughout: the borrower sends the transaction and supplies the collateral.
+
+## What is actually proven today
+
+The kernel and the proof design are real. **They are not yet what enforces the live code**, and
+this section will change as that lands:
+
+| | Status |
+|---|---|
+| dregg risk kernel (Lean 4) | Real and formally verified — but the operator falls back to an equivalent in-process LTV check when the kernel is absent, and says so via `authMode` |
+| zk settlement (`sui::groth16`) | Verifier is live on-chain. **`dregg_lending` cannot originate and `settle_batch` cannot succeed** until both circuits are re-proven upstream |
+| the circuits themselves | **Never audited.** `circuit/` contains a Poseidon gadget and no constraint system |
+| Robinhood Chain (`rh-chain/`) | **No dregg.** LTV is enforced on-chain against a Chainlink feed — the same guarantee Aave gives, not a proof |
+
+So: "provably safe" describes the design's goal, not the current deployment. What the contracts
+enforce today is a conservative LTV check against a signed or on-chain price. Everything open is
+listed in **[docs/OUTSTANDING.md](docs/OUTSTANDING.md)**.
 
 **Live demo (devnet):** https://assay-sui.vercel.app  ·  Operator API: https://assay-operator-sui.vercel.app
 

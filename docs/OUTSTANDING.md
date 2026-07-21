@@ -21,10 +21,10 @@ drained must not originate loans — but it is blocked outside this repo.
 `perloan-prep/RUNBOOK-terms-binding.md` still specifies the **pre-fix 8-term preimage**; it needs
 the collateral-type term or the on-chain binding will never match.
 
-**4. `README.md:5` claims "provably safe."** What the contracts currently enforce is an LTV check
-against a signed price. That is a normal lending protocol's guarantee, not a proof. The claim
-should be softened until the circuit work lands and is audited — especially given this repo now
-publishes an audit trail that will be read alongside it.
+**4. ~~`README.md` claims "provably safe."~~ FIXED.** The README now leads with a "What is
+actually proven today" table separating the design's goal from what the deployment enforces, and
+the strongest claims in `WHY-ASSAY-IS-DIFFERENT.md` and `ARCHITECTURE.md` were softened to match.
+Re-tighten the language as the circuits land and are audited — the table is meant to change.
 
 **5. Republish required.** `Pool`, `Position` and `OperatorCap` all changed layout, so Sui cannot
 upgrade in place. Needs a fresh package, a fresh pool, and a new `VITE_POOL`.

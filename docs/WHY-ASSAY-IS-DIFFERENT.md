@@ -66,7 +66,7 @@ only open ~6.5 hours a day — that gap is a risk, and we price it in.
 
 Every other lending app is "trust the audit." Assay is "trust the proof." The single rule that can
 bankrupt a lending protocol — letting someone borrow more than their collateral covers — is
-**mathematically proven unbreakable** on Assay, verified on-chain, priced conservatively, and it
+**designed to be enforced by a formally-verified kernel** on Assay (see the status table in the README for what is live today), verified on-chain, priced conservatively, and it
 fails safe (refuses) when anything looks wrong. You're not trusting that we wrote perfect code;
 you're trusting math that a computer checked.
 

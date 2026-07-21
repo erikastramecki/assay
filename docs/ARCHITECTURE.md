@@ -1,6 +1,6 @@
 # Assay — system architecture (V1 MVP)
 
-Assay is a **provably-safe RWA lending market**: borrow USDC against tokenized stocks
+Assay is an RWA lending market **designed around a formally-verified risk kernel** (see the README for what that enforces today): borrow USDC against tokenized stocks
 (xStocks), where every borrow is authorized in-kernel by dregg and (eventually) settled
 against a zk proof. This doc maps the tiers, who signs what, and what's built vs. to-build.
 
