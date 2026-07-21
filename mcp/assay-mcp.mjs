@@ -34,6 +34,14 @@ const CHAINS = {
     asset: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", // USDG
     assetSymbol: "USDG",
   },
+  "local-fork": {
+    id: 4663,
+    label: "Robinhood Chain (local fork)",
+    rpc: "http://127.0.0.1:8545",
+    explorer: "https://robinhoodchain.blockscout.com",
+    asset: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    assetSymbol: "USDG",
+  },
   "rh-testnet": {
     id: 46630,
     label: "Robinhood Chain testnet",
