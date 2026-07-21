@@ -238,7 +238,7 @@ token in wallet.
 | Phase | Work | Gate |
 |---|---|---|
 | **0 — Spike** ✅ **DONE** | All assumptions verified against live mainnet with zero gas and no keys: deny-list default-open, sequencer uptime feed exists, testnet exists, and 67 contracts already hold Stock Tokens in production. `rh-chain/phase0-verify.mjs`, 7/7. | ✅ passed |
-| **1 — Core** (2–3 wks) | AssayPool + Markets + Borrow + Liquidate, on-chain LTV, surplus refund, `balanceOfUI` pricing, sequencer check | Full test suite incl. **mutation tests on every guard** |
+| **1 — Core** (2–3 wks) | AssayPool + Markets + Borrow + Liquidate, on-chain LTV, surplus refund, `balanceOfUI` pricing, sequencer check | Full test suite incl. **mutation tests on every guard** *(note: we have claimed this twice and been wrong twice — an independent sweep of 139 mutations found 50 survivors. Treat as an aspiration, not a status.)* |
 | **2 — RH hazards** (1 wk) | `adminBurn` reconciliation + shortfall path, pause-aware accrual, scheduled-multiplier handling | Fork tests against real Stock Tokens |
 | **3 — Agent** (1–2 wks) | Assay MCP server, dApp borrow flow, Robinhood Wallet integration | End-to-end on testnet |
 | **4 — Audit** | Fresh adversarial rounds on the Solidity | All-clean round before mainnet |
@@ -253,7 +253,7 @@ token in wallet.
 - ✅ **Deny-list confirmed empirically.** `isBlocked()` returns false for a never-used address, the
   zero address, vitalik.eth and a plain mainnet contract address. Default-open. Registry is
   `0xe10b6f6b275de231345c20d14ab812db62151b00`. Run `node rh-chain/phase0-verify.mjs` to re-check.
-- ✅ **Sequencer uptime feed EXISTS.** Chainlink publishes an L2 Sequencer Uptime Feed for
+- ~~✅ **Sequencer uptime feed EXISTS.**~~ **SUPERSEDED — see the blocker below.** This line was written from Robinhood's docs and was never verified on-chain; `phase0-verify.mjs` contains no sequencer check. We could not locate the feed. `StaleFeedGuard` ships with the check disabled and a keeper heartbeat in its place. The original claim: Chainlink publishes an L2 Sequencer Uptime Feed for
   Robinhood Chain: *"check it before reading any price."* Liquidation safety is achievable.
 - ✅ **There is a TESTNET** (chainId 46630, `https://rpc.testnet.chain.robinhood.com/rpc`), so
   Phases 0–3 need no real money.

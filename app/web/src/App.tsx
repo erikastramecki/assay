@@ -283,10 +283,10 @@ const CHAINS = [
     lede: "Where the formally-verified path is being built. Move's type system and object model let a loan carry its own safety argument.",
     tech: [
       ["Program", "dregg_lending_async — Move package with per-position objects, dynamic rate curve, and per-collateral isolation caps"],
-      ["Pricing", "Pyth Hermes. Collateral is valued at price − 2·confidence, so the number you see is the conservative one the kernel will accept"],
+      ["Pricing", "Pyth Hermes. Collateral is valued at price − 2·confidence, so the number you see is the conservative one the authorizer will accept"],
       ["Authorization", "Operator signs an ed25519 attestation domain-separated by purpose and bound to the pool, collateral type, and an expiry — a signature for one loan cannot be replayed into another"],
       ["Settlement", "sui::groth16 BN254 verifier is deployed and live on-chain"],
-      ["Solvency gate", "No on-chain oracle in the live module — the attestation is the gate, which is why it is bound to a 120s expiry, one pool, and a one-shot nullifier"],
+      ["Solvency gate", "No on-chain oracle in the module — the attestation is the gate, which is why it is bound to a 120s expiry, one pool, and a one-shot nullifier. These bullets describe the current source; the devnet package predates them (see status)"],
       ["Why this chain", "The collateral's Move type is hashed into the loan commitment, so a position cannot be reopened against a cheaper asset — the type system enforces it, not a check we remembered to write"],
     ],
     caveat: "Origination and settle_batch stay disabled until both circuits are re-proven and audited. The devnet package predates the round 1–6 fixes and holds test coins only — Pool, Position and OperatorCap changed layout, so it needs a republish rather than an upgrade.",
@@ -335,7 +335,7 @@ function Chains() {
 // that each gate now carries its real state, and the ones that aren't live say so on the page
 // rather than in a doc nobody opens.
 const GATES = [
-  ["01", "Conservative valuation", "on", "Collateral is valued at a live Pyth price marked down by twice its own confidence interval, and a stale price is refused outright. Off-session the staleness bound tightens from 60s to 15s. This runs on every borrow today."],
+  ["01", "Conservative valuation", "on", "Collateral is valued at a live Pyth price marked down by twice its own confidence interval, and a stale price is refused outright. For tokenized equities, the staleness bound tightens from 60s to 15s outside the session (crypto trades 24/7, so it is always in-session). This runs on every borrow today."],
   ["02", "On-chain LTV enforcement", "part", "On Robinhood Chain the contract holding the money checks the limit against Chainlink, and a borrow over the line reverts — but that chain is not deployed yet. On Sui the live module has no on-chain oracle: a short-lived, single-use operator attestation is the solvency gate, so the LTV decision is made off-chain."],
   ["03", "Formally-verified kernel", "part", "dregg is real and machine-checked in Lean 4. Today the operator falls back to an equivalent in-process LTV check when the kernel is absent — and reports which one ran via authMode."],
   ["04", "Proof-gated settlement", "off", "The Groth16 verifier is deployed on Sui. Settlement stays disabled until both circuits are re-proven and audited — so it is off, not quietly trusted."],
@@ -346,7 +346,7 @@ function Proof() {
     <section className="band proof" id="proof">
       <div className="wrap">
         <div className="band-head"><div><span className="eyebrow">Why it's safe</span><h2>Four gates — and where each one actually stands</h2>
-          <p>Two are enforced on every loan today. Two are still being built, and say so.</p></div></div>
+          <p>One is enforced on every loan today, two run in part, one is switched off until it's finished. Each says which.</p></div></div>
         <div className="flow">
           {GATES.map(([no, h, state, p]) => (
             <div className={"step gate-" + state} key={no}>

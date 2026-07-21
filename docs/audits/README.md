@@ -26,7 +26,7 @@ covered.
 |---|---|---|---|
 | [Sui 1–6](sui-rounds-1-6.md) | `move/` — the Move protocol | 9, 10, 17, 9, 9, 12 | fixes committed; **no round ever came back clean** |
 | [Solidity 1](solidity-round-1.md) | `rh-chain/` — the Robinhood Chain port | 19 | criticals + highs fixed; tail open |
-| [Solidity 2](solidity-round-1.md#round-2) | `rh-chain/` — re-audit + mutation sweep | see round-1 report | **not clean**; ~50 mutations survive a green suite |
+| [Solidity 2](solidity-round-1.md) | `rh-chain/` — re-audit + mutation sweep | see round-1 report | **not clean**; ~50 mutations survive a green suite |
 
 Round 2 has no separate file: its findings are corrections to round 1 and are folded into that
 report. It is listed separately here because the round-1 document, read alone, states a
