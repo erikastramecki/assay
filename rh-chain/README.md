@@ -91,6 +91,10 @@ Run under a supervisor and alert on the WARN/ALERT lines: a silently dead keeper
 
 ## Modules
 
+- `AssayPool` — lender vault (USDG in, transferable ERC-20 shares), borrow-index accrual,
+  borrow / repay / liquidate. The accrual and share maths are ported from the Sui implementation,
+  the one part of that codebase six adversarial audit rounds never landed a confirmed finding
+  against. Each audit-derived invariant is carried over and marked with the finding that taught it.
 - `AssayMarkets` — risk registry. Which Stock Tokens are accepted, on what terms, and when.
   Enforces `MIN_RISK_GAP_BPS` (20pp) in code, so a future parameter change cannot quietly narrow
   the one thing protecting lenders. Parameter changes are timelocked 2 days and re-validated at
