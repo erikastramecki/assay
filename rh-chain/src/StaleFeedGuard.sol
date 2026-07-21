@@ -16,10 +16,27 @@ import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 /// picking a signed-publisher oracle was meant to avoid. So the honest response to off-hours is
 /// "there is no fresh price", not "synthesise one".
 ///
+/// GROUNDED IN THE REAL FEED PARAMETERS. Every Chainlink feed on Robinhood Chain — all 34 equity
+/// feeds and the crypto feeds alike — runs a **86400s (24h) heartbeat with a 0.5% deviation
+/// trigger**. That is the actual contract, read from Chainlink's feed directory, and it shapes
+/// this design:
+///
+///   - A staleness bound TIGHTER than the heartbeat is wrong and would revert constantly. An
+///     earlier draft of this file used 3600s in-session and 300s off-hours; both would have
+///     bricked the protocol every night, because a feed that has not moved 0.5% legitimately
+///     does not update for up to 24 hours.
+///   - The freshness guarantee that actually protects a lender is the DEVIATION threshold, not
+///     the heartbeat: a price up to 24h old means "this has not moved more than 0.5% since".
+///     The staleness bound therefore exists to catch a BROKEN oracle, not a quiet market, and is
+///     set to heartbeat + grace.
+///   - Off-hours protection cannot come from a tighter staleness bound, because when the market
+///     is closed the price genuinely is not moving and no update is due. It comes from the
+///     session flag: no new borrows, and no liquidations at a price nobody can verify.
+///
 /// This contract therefore does three things, and refuses to guess:
 ///   1. checks the L2 sequencer is up (and has been up long enough to trust)
-///   2. checks the feed is fresh, with a MUCH tighter bound off-hours than in-session
-///   3. reports session state so callers can apply an off-hours haircut or block new borrows
+///   2. checks the feed has not gone silent past heartbeat + grace (a broken-oracle check)
+///   3. reports session state, so callers gate borrows and liquidations on a live market
 ///
 /// It fails CLOSED everywhere. A revert is the correct outcome for an unknown price.
 contract StaleFeedGuard {
@@ -29,16 +46,25 @@ contract StaleFeedGuard {
     error PriceNotPositive(int256 answer);
     error RoundIncomplete();
     error FeedNotConfigured(address token);
+    error StalenessBelowHeartbeat(uint32 given, uint32 heartbeat);
 
     /// Per-token oracle configuration. Heartbeats come from Chainlink's Robinhood feeds page and
     /// differ per feed — never hardcode a single global value.
     struct FeedConfig {
         AggregatorV3Interface feed;
-        uint32 maxStaleInSession; // e.g. 3600s, must exceed the feed's heartbeat
-        uint32 maxStaleOffHours; // tighter: off-hours staleness means real gap risk
+        /// Must be >= the feed's heartbeat, plus grace. On Robinhood Chain every feed is 86400s,
+        /// so this is ~90000s. Anything tighter reverts on a quiet market rather than on a
+        /// broken one.
+        uint32 maxStaleness;
         uint8 decimals;
         bool configured;
     }
+
+    /// Every Robinhood Chain feed publishes on this heartbeat (verified against Chainlink's feed
+    /// directory). Exposed so deployment scripts can assert their config against it.
+    uint32 public constant FEED_HEARTBEAT = 86_400;
+    /// Grace on top of the heartbeat before we call a feed broken.
+    uint32 public constant STALENESS_GRACE = 3_600;
 
     /// After a sequencer outage, prices are fresh but the market had no chance to react. Reject
     /// for a grace period rather than liquidating people on a resumed-but-unwound market.
@@ -85,9 +111,10 @@ contract StaleFeedGuard {
         if (updatedAt == 0 || answeredInRound < roundId) revert RoundIncomplete();
 
         inSession = isUsMarketHours(block.timestamp);
-        uint256 limit = inSession ? c.maxStaleInSession : c.maxStaleOffHours;
         uint256 age = block.timestamp - updatedAt;
-        if (age > limit) revert PriceStale(age, limit, inSession);
+        // One bound, sized to the heartbeat: this detects a SILENT oracle. It deliberately does
+        // not try to detect a stale market — see the note at the top of this file.
+        if (age > c.maxStaleness) revert PriceStale(age, c.maxStaleness, inSession);
 
         return (uint256(answer), c.decimals, inSession);
     }
@@ -119,14 +146,12 @@ contract StaleFeedGuard {
 
     /// Internal setter — the owning market registry decides access control. Kept internal so this
     /// contract has no admin surface of its own to get wrong.
-    function _setFeed(
-        address token,
-        AggregatorV3Interface feed,
-        uint32 maxStaleInSession,
-        uint32 maxStaleOffHours,
-        uint8 decimals
-    ) internal {
-        _feeds[token] =
-            FeedConfig(feed, maxStaleInSession, maxStaleOffHours, decimals, true);
+    /// Reverts if `maxStaleness` is tighter than the heartbeat — a misconfiguration that would
+    /// look like a working system until the first quiet hour and then reject every borrow.
+    function _setFeed(address token, AggregatorV3Interface feed, uint32 maxStaleness, uint8 decimals)
+        internal
+    {
+        if (maxStaleness < FEED_HEARTBEAT) revert StalenessBelowHeartbeat(maxStaleness, FEED_HEARTBEAT);
+        _feeds[token] = FeedConfig(feed, maxStaleness, decimals, true);
     }
 }

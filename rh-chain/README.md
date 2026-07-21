@@ -38,6 +38,28 @@ Three risks stack here and none of them is hedgeable:
 - `adminBurn` can destroy it, held by a **plain EOA** with no multisig or timelock
 - the price is **blind nights and weekends**
 
+## Oracle reality (grounded, not assumed)
+
+Every Chainlink feed on Robinhood Chain — all 34 Robinhood equity feeds and the crypto feeds —
+runs an **86,400s (24h) heartbeat with a 0.5% deviation trigger**. Pulled from Chainlink's feed
+directory via `node script/fetch-feeds.mjs`, which fails loudly if the heartbeat ever changes.
+
+This shaped the design, and corrected a mistake:
+
+- A staleness bound **tighter than the heartbeat is wrong**. The first draft used 3600s in-session
+  and 300s off-hours. The live AAPL feed was ~2.4 hours old when checked, quoting $326.49 — a
+  perfectly healthy price that both of those bounds would have rejected. It would have bricked
+  borrowing every quiet hour and every night.
+- The guarantee that protects a lender is the **deviation threshold, not the heartbeat**: a price
+  up to 24h old means "this has not moved 0.5% since". So the staleness bound exists to catch a
+  **broken** oracle, not a quiet market, and is set to heartbeat + 1h grace (90,000s).
+- **Off-hours protection cannot come from a staleness bound**, because when the market is shut the
+  price genuinely is not moving and no update is due. It comes from the session flag: no new
+  borrows, and no liquidation at a price nobody can verify. The LTV buffer carries the rest.
+
+`_setFeed` rejects any `maxStaleness` below the heartbeat, so this class of misconfiguration
+cannot be deployed.
+
 ## Modules
 
 - `StaleFeedGuard` — sequencer uptime + grace period, per-feed staleness with a tighter off-hours

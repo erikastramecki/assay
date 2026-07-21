@@ -47,8 +47,8 @@ contract MockStock is ERC20 {
 
 contract GuardHarness is StaleFeedGuard {
     constructor(AggregatorV3Interface s) StaleFeedGuard(s) {}
-    function setFeed(address t, AggregatorV3Interface f, uint32 a, uint32 b, uint8 d) external {
-        _setFeed(t, f, a, b, d);
+    function setFeed(address t, AggregatorV3Interface f, uint32 maxStale, uint8 d) external {
+        _setFeed(t, f, maxStale, d);
     }
 }
 
@@ -79,7 +79,8 @@ contract StaleFeedGuardTest is Test {
         seq.setStartedAt(block.timestamp - 2 days); // well past the grace period
         px = new MockFeed(200e8, 8);
         g = new GuardHarness(seq);
-        g.setFeed(TOK, px, 3600, 300, 8);
+        // heartbeat + grace, matching the real 86400s Robinhood Chain feeds
+        g.setFeed(TOK, px, 90_000, 8);
     }
 
     function test_freshPriceInSession() public view {
@@ -93,22 +94,43 @@ contract StaleFeedGuardTest is Test {
     function test_weekendStalePriceIsRejected() public {
         uint256 fridayClose = MON_IN_SESSION + 4 days; // Mon + 4 = Friday
         px.set(200e8, fridayClose);
-        uint256 sunday = fridayClose + 2 days;
+        uint256 sunday = fridayClose + 2 days; // > heartbeat + grace, so the feed reads as silent
         vm.warp(sunday);
         assertFalse(g.isUsMarketHours(sunday), "fixture must actually be a weekend");
         vm.expectRevert();
         g.priceOf(TOK);
     }
 
-    function test_offHoursUsesTheTighterBound() public {
-        // 03:00 UTC on a weekday: out of session. 600s old exceeds the 300s off-hours bound
-        // but is well inside the 3600s in-session bound, so only the tighter bound rejects it.
+    /// A quiet market must NOT revert. Every Robinhood Chain feed is 86400s/0.5%, so a price
+    /// that is hours old simply means the stock has not moved 0.5%. An earlier draft used a
+    /// 300s off-hours bound, which would have rejected every borrow overnight.
+    function test_quietMarketDoesNotRevert() public {
         uint256 night = (MON_IN_SESSION / 86400) * 86400 + 3 hours;
-        px.set(200e8, night - 600);
+        px.set(200e8, night - 6 hours); // 6h old: normal for a 24h heartbeat
         vm.warp(night);
-        assertFalse(g.isUsMarketHours(night));
+        assertFalse(g.isUsMarketHours(night), "fixture is off-hours");
+        (uint256 p,, bool inSession) = g.priceOf(TOK);
+        assertEq(p, 200e8);
+        assertFalse(inSession, "must report off-hours so callers can gate borrows");
+    }
+
+    /// But a SILENT oracle — past heartbeat + grace — is a broken oracle and must revert.
+    function test_silentOracleBeyondHeartbeatReverts() public {
+        uint256 t = MON_IN_SESSION;
+        px.set(200e8, t - 90_001);
+        vm.warp(t);
         vm.expectRevert();
         g.priceOf(TOK);
+    }
+
+    /// Configuring a bound tighter than the heartbeat is a misconfiguration that would look fine
+    /// until the first quiet hour. Reject it at config time.
+    function test_stalenessBelowHeartbeatIsRejected() public {
+        MockFeed f2 = new MockFeed(100e8, 8);
+        vm.expectRevert(
+            abi.encodeWithSelector(StaleFeedGuard.StalenessBelowHeartbeat.selector, uint32(3600), uint32(86_400))
+        );
+        g.setFeed(address(0xCC), f2, 3600, 8);
     }
 
     function test_sequencerDownRejects() public {
