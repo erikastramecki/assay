@@ -20,7 +20,8 @@ things testnet adds are your key and real block times.
 ```bash
 export PK=0x…                       # a testnet key
 cd rh-chain
-forge script script/Deploy.s.sol --rpc-url rh_testnet --broadcast --private-key $PK
+FOUNDRY_PROFILE=script forge script script/Deploy.s.sol \
+  --rpc-url rh_testnet --broadcast --private-key $PK
 ```
 
 Set `USDG`, `STOCK`, `FEED` in env if the testnet addresses differ from mainnet's. Every decimal is
