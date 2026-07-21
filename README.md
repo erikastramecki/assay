@@ -21,7 +21,7 @@ So: "provably safe" describes the design's goal, not the current deployment. Wha
 enforce today is a conservative LTV check against a signed or on-chain price. Everything open is
 listed in **[docs/OUTSTANDING.md](docs/OUTSTANDING.md)**.
 
-**Live demo (devnet):** https://assay-sui.vercel.app  ·  Operator API: https://assay-operator-sui.vercel.app
+**Live demo (devnet):** https://assay-sui-web.vercel.app  ·  Operator API: https://assay-operator-sui.vercel.app
 
 **Security audits:** [docs/audits/](docs/audits/) — adversarial rounds with independent verification, published fix-first. **[docs/OUTSTANDING.md](docs/OUTSTANDING.md)** lists everything known-open, including items that block mainnet.
 
